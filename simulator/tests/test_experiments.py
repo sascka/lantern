@@ -17,7 +17,7 @@ from lantern_sim.experiments import (
 from lantern_sim.faults import NetworkConditions
 from lantern_sim.model import SimulationLimitError, SimulationValidationError
 from lantern_sim.routing import BinarySprayAndWait, DirectDelivery, EpidemicRouting
-from lantern_sim.scenarios import MeshScenarioConfig
+from lantern_sim.scenarios import ContactRoundScenarioConfig, MeshScenarioConfig
 
 
 def make_scenario(node_count: int = 4) -> MeshScenarioConfig:
@@ -34,10 +34,7 @@ def make_scenario(node_count: int = 4) -> MeshScenarioConfig:
     [
         ((), (42,), "scenarios"),
         (
-            tuple(
-                make_scenario(index + 4)
-                for index in range(MAX_BATCH_SCENARIOS + 1)
-            ),
+            tuple(make_scenario(index + 4) for index in range(MAX_BATCH_SCENARIOS + 1)),
             (42,),
             "scenarios",
         ),
@@ -73,7 +70,12 @@ def test_batch_run_count_has_hard_limit() -> None:
     with pytest.raises(SimulationLimitError, match="run count"):
         run_batch_experiment(
             config,
-            (DirectDelivery(), EpidemicRouting()),
+            (
+                DirectDelivery(),
+                EpidemicRouting(),
+                BinarySprayAndWait(copy_budget=2),
+                BinarySprayAndWait(copy_budget=4),
+            ),
         )
 
 
@@ -84,6 +86,14 @@ def test_batch_rejects_empty_and_duplicate_policies() -> None:
         run_batch_experiment(config, ())
     with pytest.raises(SimulationValidationError, match="unique"):
         run_batch_experiment(config, (DirectDelivery(), DirectDelivery()))
+
+
+def test_batch_rejects_unknown_scenario_type() -> None:
+    with pytest.raises(SimulationValidationError, match="unsupported"):
+        BatchExperimentConfig(
+            scenarios=(object(),),  # type: ignore[arg-type]
+            seeds=(42,),
+        )
 
 
 def test_batch_result_is_compact_aggregated_and_repeatable() -> None:
@@ -123,6 +133,11 @@ def test_batch_result_is_compact_aggregated_and_repeatable() -> None:
     assert isinstance(serialized_runs, list)
     assert all("attempts" not in item for item in serialized_runs)
     assert all("deliveries" not in item for item in serialized_runs)
+    assert all(item.scenario == "uniform_contacts" for item in first.runs)
+    assert all(
+        item.min_delivery_rate <= item.mean_delivery_rate <= item.max_delivery_rate
+        for item in first.aggregates
+    )
 
 
 def test_aggregate_uses_all_deliveries_instead_of_averaging_run_averages() -> None:
@@ -133,9 +148,7 @@ def test_aggregate_uses_all_deliveries_instead_of_averaging_run_averages() -> No
     result = run_batch_experiment(config, (EpidemicRouting(),))
     aggregate = result.aggregates[0]
 
-    assert aggregate.total_messages == sum(
-        item.message_count for item in result.runs
-    )
+    assert aggregate.total_messages == sum(item.message_count for item in result.runs)
     assert aggregate.total_delivered == sum(
         item.delivered_count for item in result.runs
     )
@@ -168,11 +181,66 @@ def test_batch_cli_outputs_parseable_json(capsys: pytest.CaptureFixture[str]) ->
 
     output = json.loads(capsys.readouterr().out)
     assert exit_code == 0
-    assert output["format_version"] == 1
+    assert output["format_version"] == 2
     assert output["spdx_license"] == "MPL-2.0"
     assert output["seeds"] == [42, 43]
     assert output["run_count"] == 6
     assert len(output["aggregates"]) == 3
+
+
+def test_batch_cli_supports_rounds_and_multiple_copy_budgets(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "--contact-model",
+            "rounds",
+            "--seeds",
+            "42,43",
+            "--nodes",
+            "20,100",
+            "--messages",
+            "2",
+            "--rounds",
+            "4",
+            "--copy-budgets",
+            "4,8",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert output["run_count"] == 16
+    assert len(output["aggregates"]) == 8
+    assert {item["scenario"] for item in output["runs"]} == {"uniform_contact_rounds"}
+    spray_budgets = {
+        item["policy_parameters"]["copy_budget"]
+        for item in output["aggregates"]
+        if item["policy"] == "spray_and_wait"
+    }
+    assert spray_budgets == {4, 8}
+
+
+def test_batch_keeps_scenario_models_separate() -> None:
+    config = BatchExperimentConfig(
+        scenarios=(
+            make_scenario(),
+            ContactRoundScenarioConfig(
+                node_count=4,
+                message_count=2,
+                round_count=2,
+                payload_size=128,
+            ),
+        ),
+        seeds=(42,),
+    )
+
+    result = run_batch_experiment(config, (EpidemicRouting(),))
+
+    assert [item.scenario for item in result.aggregates] == [
+        "uniform_contacts",
+        "uniform_contact_rounds",
+    ]
 
 
 def test_batch_cli_rejects_invalid_node_count() -> None:

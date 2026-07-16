@@ -4,10 +4,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
 import random
 import re
+from dataclasses import dataclass, field
+from enum import Enum
 
 MAX_NODE_ID_LENGTH = 64
 MAX_ENVELOPE_SIZE = 64 * 1024
@@ -23,7 +23,7 @@ MAX_HOPS = 16
 DEFAULT_MAX_HOPS = 16
 MIN_COPY_BUDGET = 1
 MAX_COPY_BUDGET = 64
-DEFAULT_COPY_BUDGET = 4
+DEFAULT_COPY_BUDGET = 32
 
 _NODE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 _MESSAGE_ID_PATTERN = re.compile(r"[0-9a-f]{32}", re.ASCII)
@@ -271,18 +271,14 @@ class Encounter:
         validate_node_id(self.left)
         validate_node_id(self.right)
         if self.left == self.right:
-            raise SimulationValidationError(
-                "an encounter requires two different nodes"
-            )
+            raise SimulationValidationError("an encounter requires two different nodes")
 
 
 class MessageIdGenerator:
     """Create deterministic simulation-only identifiers from a fixed seed."""
 
     def __init__(self, seed: int) -> None:
-        _validate_bounded_integer(
-            seed, field_name="seed", minimum=0, maximum=MAX_SEED
-        )
+        _validate_bounded_integer(seed, field_name="seed", minimum=0, maximum=MAX_SEED)
         self._random = random.Random(seed)
         self._issued: set[str] = set()
 
@@ -329,12 +325,8 @@ class NodeState:
     def messages(self) -> tuple[StoredMessage, ...]:
         return tuple(self._messages[key] for key in sorted(self._messages))
 
-    def store_origin(
-        self, message: Message, *, copies_left: int | None = None
-    ) -> bool:
-        return self._store(
-            StoredMessage.from_origin(message, copies_left=copies_left)
-        )
+    def store_origin(self, message: Message, *, copies_left: int | None = None) -> bool:
+        return self._store(StoredMessage.from_origin(message, copies_left=copies_left))
 
     def store_forwarded(self, stored_message: StoredMessage) -> bool:
         return self._store(stored_message)

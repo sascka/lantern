@@ -26,9 +26,7 @@ def test_tombstone_config_rejects_invalid_values(
 
 
 def test_tombstone_blocks_id_until_expiration_boundary() -> None:
-    store = TombstoneStore(
-        TombstoneConfig(max_entries=2, retention_seconds=60)
-    )
+    store = TombstoneStore(TombstoneConfig(max_entries=2, retention_seconds=60))
     message_id = "0" * 32
 
     store.add(message_id, at=10)
@@ -39,9 +37,7 @@ def test_tombstone_blocks_id_until_expiration_boundary() -> None:
 
 
 def test_tombstone_store_evicts_oldest_entry_when_full() -> None:
-    store = TombstoneStore(
-        TombstoneConfig(max_entries=2, retention_seconds=300)
-    )
+    store = TombstoneStore(TombstoneConfig(max_entries=2, retention_seconds=300))
     oldest_id = "0" * 32
     second_id = "1" * 32
     incoming_id = "2" * 32
@@ -58,9 +54,7 @@ def test_tombstone_store_evicts_oldest_entry_when_full() -> None:
 
 
 def test_readding_same_id_refreshes_without_growing_store() -> None:
-    store = TombstoneStore(
-        TombstoneConfig(max_entries=1, retention_seconds=60)
-    )
+    store = TombstoneStore(TombstoneConfig(max_entries=1, retention_seconds=60))
     message_id = "0" * 32
     store.add(message_id, at=10)
 
@@ -72,9 +66,7 @@ def test_readding_same_id_refreshes_without_growing_store() -> None:
 
 
 def test_purge_expired_returns_entries_in_message_id_order() -> None:
-    store = TombstoneStore(
-        TombstoneConfig(max_entries=2, retention_seconds=60)
-    )
+    store = TombstoneStore(TombstoneConfig(max_entries=2, retention_seconds=60))
     store.add("1" * 32, at=0)
     store.add("0" * 32, at=0)
 

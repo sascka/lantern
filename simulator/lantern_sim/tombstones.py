@@ -73,9 +73,7 @@ class TombstoneEntry:
         _validate_non_negative_integer(self.recorded_at, "recorded_at")
         _validate_non_negative_integer(self.expires_at, "expires_at")
         if self.expires_at <= self.recorded_at:
-            raise SimulationValidationError(
-                "expires_at must be later than recorded_at"
-            )
+            raise SimulationValidationError("expires_at must be later than recorded_at")
 
 
 @dataclass(frozen=True, slots=True)

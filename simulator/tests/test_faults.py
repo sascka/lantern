@@ -10,9 +10,7 @@ from lantern_sim.model import SimulationValidationError
 
 @pytest.mark.parametrize("percent", [0, 100])
 def test_network_conditions_accept_percent_boundaries(percent: int) -> None:
-    conditions = NetworkConditions(
-        loss_percent=percent, duplicate_percent=percent
-    )
+    conditions = NetworkConditions(loss_percent=percent, duplicate_percent=percent)
 
     assert conditions.loss_percent == percent
     assert conditions.duplicate_percent == percent

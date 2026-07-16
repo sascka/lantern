@@ -22,7 +22,7 @@ from lantern_sim.routing import (
     DirectDelivery,
     EpidemicRouting,
 )
-from lantern_sim.scenarios import MeshScenarioConfig
+from lantern_sim.scenarios import ContactRoundScenarioConfig, MeshScenarioConfig
 
 DEFAULT_BATCH_SEEDS = (20_260_716, 20_260_717, 20_260_718)
 DEFAULT_BATCH_NODES = (20, 50)
@@ -35,14 +35,18 @@ def _parse_integer_list(value: str) -> tuple[int, ...]:
     try:
         return tuple(int(item.strip()) for item in parts)
     except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            "expected comma-separated integers"
-        ) from error
+        raise argparse.ArgumentTypeError("expected comma-separated integers") from error
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a bounded batch of Lantern routing experiments."
+    )
+    parser.add_argument(
+        "--contact-model",
+        choices=("sequential", "rounds"),
+        default="sequential",
+        help="legacy sequential contacts or size-comparable contact rounds",
     )
     parser.add_argument(
         "--seeds",
@@ -69,6 +73,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="encounter count multiplier for each node count",
     )
     parser.add_argument(
+        "--rounds",
+        type=int,
+        default=40,
+        help="contact round count for the rounds model",
+    )
+    parser.add_argument(
         "--payload-size",
         type=int,
         default=256,
@@ -86,11 +96,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_HOPS,
         help="maximum number of sequential transmissions",
     )
-    parser.add_argument(
+    copy_budget_group = parser.add_mutually_exclusive_group()
+    copy_budget_group.add_argument(
         "--copy-budget",
         type=int,
-        default=DEFAULT_COPY_BUDGET,
-        help="initial copy-token budget for Spray-and-Wait",
+        help="one initial Spray-and-Wait copy-token budget",
+    )
+    copy_budget_group.add_argument(
+        "--copy-budgets",
+        type=_parse_integer_list,
+        help="comma-separated Spray-and-Wait copy-token budgets",
     )
     parser.add_argument(
         "--loss-percent",
@@ -116,25 +131,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
-        scenarios = tuple(
-            MeshScenarioConfig(
-                node_count=node_count,
-                message_count=args.messages,
-                encounter_count=node_count * args.encounters_per_node,
-                payload_size=args.payload_size,
-                ttl_seconds=args.ttl_seconds,
-                max_hops=args.max_hops,
+        if args.contact_model == "sequential":
+            scenarios = tuple(
+                MeshScenarioConfig(
+                    node_count=node_count,
+                    message_count=args.messages,
+                    encounter_count=node_count * args.encounters_per_node,
+                    payload_size=args.payload_size,
+                    ttl_seconds=args.ttl_seconds,
+                    max_hops=args.max_hops,
+                )
+                for node_count in args.nodes
             )
-            for node_count in args.nodes
-        )
+        else:
+            scenarios = tuple(
+                ContactRoundScenarioConfig(
+                    node_count=node_count,
+                    message_count=args.messages,
+                    round_count=args.rounds,
+                    payload_size=args.payload_size,
+                    ttl_seconds=args.ttl_seconds,
+                    max_hops=args.max_hops,
+                )
+                for node_count in args.nodes
+            )
         config = BatchExperimentConfig(
             scenarios=scenarios,
             seeds=args.seeds,
         )
+        copy_budgets = args.copy_budgets
+        if copy_budgets is None:
+            copy_budgets = (
+                args.copy_budget
+                if args.copy_budget is not None
+                else DEFAULT_COPY_BUDGET,
+            )
         policies = (
             DirectDelivery(),
             EpidemicRouting(),
-            BinarySprayAndWait(args.copy_budget),
+            *(BinarySprayAndWait(item) for item in copy_budgets),
         )
         result = run_batch_experiment(
             config,

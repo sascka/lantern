@@ -2,7 +2,6 @@
 
 """Deterministic routing simulator for Lantern."""
 
-from lantern_sim.faults import NetworkConditions
 from lantern_sim.experiments import (
     AggregateResult,
     BatchExperimentConfig,
@@ -10,15 +9,16 @@ from lantern_sim.experiments import (
     CompactRunResult,
     run_batch_experiment,
 )
+from lantern_sim.faults import NetworkConditions
 from lantern_sim.model import (
     Encounter,
     Message,
     MessageIdGenerator,
     NodeState,
     StorageQuota,
+    StoredMessage,
     StoreOutcome,
     StoreResult,
-    StoredMessage,
 )
 from lantern_sim.routing import (
     BinarySprayAndWait,
@@ -28,9 +28,13 @@ from lantern_sim.routing import (
     RoutingPolicy,
 )
 from lantern_sim.scenarios import (
+    ContactRoundScenarioConfig,
     GeneratedScenario,
     MeshScenarioConfig,
+    generate_configured_scenario,
+    generate_contact_round_scenario,
     generate_uniform_contact_scenario,
+    run_configured_scenario,
     run_uniform_contact_scenario,
 )
 from lantern_sim.simulation import (
@@ -59,6 +63,7 @@ __all__ = [
     "BinarySprayAndWait",
     "BlockReason",
     "CompactRunResult",
+    "ContactRoundScenarioConfig",
     "DirectDelivery",
     "Encounter",
     "EpidemicRouting",
@@ -85,7 +90,10 @@ __all__ = [
     "TombstoneRejection",
     "TombstoneStore",
     "TransferAttempt",
+    "generate_configured_scenario",
+    "generate_contact_round_scenario",
     "generate_uniform_contact_scenario",
     "run_batch_experiment",
+    "run_configured_scenario",
     "run_uniform_contact_scenario",
 ]

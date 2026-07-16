@@ -119,8 +119,7 @@ class BinarySprayAndWait:
             raise SimulationValidationError("copy_budget must be an integer")
         if not MIN_COPY_BUDGET <= copy_budget <= MAX_COPY_BUDGET:
             raise SimulationValidationError(
-                "copy_budget must be between "
-                f"{MIN_COPY_BUDGET} and {MAX_COPY_BUDGET}"
+                f"copy_budget must be between {MIN_COPY_BUDGET} and {MAX_COPY_BUDGET}"
             )
         self.initial_copies_left = copy_budget
         self.parameters = (("copy_budget", copy_budget),)

@@ -9,8 +9,10 @@ from lantern_sim.model import (
     Encounter,
     Message,
     MessageIdGenerator,
+    NodeState,
     SimulationValidationError,
     StorageQuota,
+    StoredMessage,
     StoreOutcome,
 )
 from lantern_sim.routing import BinarySprayAndWait, DirectDelivery, EpidemicRouting
@@ -138,6 +140,35 @@ def test_creation_precedes_encounter_at_same_time() -> None:
     assert result.average_delivery_delay == 0.0
 
 
+def test_maintenance_runs_once_per_simulated_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original_remove_expired = NodeState.remove_expired
+
+    def counted_remove_expired(state: NodeState, at: int) -> tuple[StoredMessage, ...]:
+        nonlocal calls
+        calls += 1
+        return original_remove_expired(state, at)
+
+    monkeypatch.setattr(NodeState, "remove_expired", counted_remove_expired)
+    simulation = Simulation(
+        node_ids=("alice", "bob", "relay", "peer"),
+        messages=(make_message(),),
+        encounters=(
+            Encounter(at=10, left="alice", right="relay"),
+            Encounter(at=10, left="bob", right="peer"),
+            Encounter(at=20, left="relay", right="bob"),
+            Encounter(at=20, left="alice", right="peer"),
+        ),
+        seed=42,
+    )
+
+    simulation.run(EpidemicRouting())
+
+    assert calls == 12
+
+
 def test_simulation_rejects_unknown_encounter_node() -> None:
     with pytest.raises(SimulationValidationError, match="unknown encounter node"):
         Simulation(
@@ -154,6 +185,29 @@ def test_repeated_runs_are_identical() -> None:
 
     assert first == second
     assert first.to_dict() == second.to_dict()
+
+
+def test_summary_omits_detailed_event_arrays() -> None:
+    result = run_three_node_chain(EpidemicRouting(), seed=42, payload_size=128)
+
+    summary = result.to_summary_dict()
+    detailed = result.to_dict()
+
+    assert summary["attempt_count"] == 2
+    assert summary["transmission_count"] == 2
+    assert summary["delivered_count"] == 1
+    assert all(detailed[key] == value for key, value in summary.items())
+    for field_name in (
+        "attempts",
+        "blocked_transfers",
+        "deliveries",
+        "removals",
+        "storage_rejections",
+        "tombstone_events",
+        "tombstone_rejections",
+        "transmissions",
+    ):
+        assert field_name not in summary
 
 
 def test_ttl_expires_on_all_nodes_before_late_encounter() -> None:
@@ -186,8 +240,7 @@ def test_one_hop_budget_blocks_transfer_to_non_destination() -> None:
     assert result.transmission_count == 0
     assert len(result.blocked_transfers) == 1
     assert (
-        result.blocked_transfers[0].reason
-        is BlockReason.HOP_LIMIT_BEFORE_DESTINATION
+        result.blocked_transfers[0].reason is BlockReason.HOP_LIMIT_BEFORE_DESTINATION
     )
     assert result.blocked_transfers[0].sender == "alice"
     assert result.blocked_transfers[0].receiver == "relay"
@@ -246,9 +299,7 @@ def test_result_serializes_expiration_and_hop_block_reasons() -> None:
     ).to_dict()
 
     assert blocked["blocked_transfer_count"] == 1
-    assert blocked["blocked_transfers"][0]["reason"] == (
-        "hop_limit_before_destination"
-    )
+    assert blocked["blocked_transfers"][0]["reason"] == ("hop_limit_before_destination")
 
 
 def test_spray_and_wait_delivers_chain_with_two_copy_tokens() -> None:
@@ -316,9 +367,7 @@ def test_binary_spray_never_exceeds_copy_budget() -> None:
     assert result.transmission_count == 4
     assert result.peak_stored_messages == 4
     assert result.peak_stored_bytes == 4 * 128
-    assert all(
-        item.receiver_copies_left is not None for item in result.transmissions
-    )
+    assert all(item.receiver_copies_left is not None for item in result.transmissions)
 
 
 def test_result_serializes_spray_policy_parameters() -> None:
@@ -400,9 +449,7 @@ def test_reordered_batch_delivers_all_messages_in_reverse_order() -> None:
         seed=42,
     )
 
-    result = simulation.run(
-        DirectDelivery(), NetworkConditions(reorder=True)
-    )
+    result = simulation.run(DirectDelivery(), NetworkConditions(reorder=True))
 
     assert result.delivered_count == 2
     assert [item.message_id for item in result.transmissions] == [high_id, low_id]
@@ -438,9 +485,7 @@ def test_retry_after_loss_preserves_spray_copy_budget() -> None:
 
 
 def test_repeated_faulty_runs_are_identical() -> None:
-    conditions = NetworkConditions(
-        loss_percent=20, duplicate_percent=10, reorder=True
-    )
+    conditions = NetworkConditions(loss_percent=20, duplicate_percent=10, reorder=True)
 
     first = run_three_node_chain(
         EpidemicRouting(), seed=20260716, network_conditions=conditions
@@ -503,9 +548,7 @@ def test_item_larger_than_quota_is_rejected_without_network_attempt() -> None:
     assert result.transmission_count == 0
     assert result.eviction_count == 0
     assert result.quota_rejection_count == 1
-    assert result.storage_rejections[0].reason is (
-        StoreOutcome.ITEM_EXCEEDS_BYTE_QUOTA
-    )
+    assert result.storage_rejections[0].reason is (StoreOutcome.ITEM_EXCEEDS_BYTE_QUOTA)
     assert result.peak_node_stored_messages == 0
     assert result.peak_node_stored_bytes == 0
     assert result.to_dict()["storage_quota"] == {
@@ -543,9 +586,7 @@ def test_tombstone_blocks_immediate_return_after_quota_eviction() -> None:
     result = simulation.run(
         DirectDelivery(),
         storage_quota=StorageQuota(max_messages=1, max_bytes=128),
-        tombstone_config=TombstoneConfig(
-            max_entries=2, retention_seconds=60
-        ),
+        tombstone_config=TombstoneConfig(max_entries=2, retention_seconds=60),
     )
 
     assert result.attempt_count == 3
@@ -570,9 +611,7 @@ def test_ttl_expiration_creates_tombstone_on_each_honest_holder() -> None:
 
     result = simulation.run(
         EpidemicRouting(),
-        tombstone_config=TombstoneConfig(
-            max_entries=2, retention_seconds=60
-        ),
+        tombstone_config=TombstoneConfig(max_entries=2, retention_seconds=60),
     )
 
     assert result.transmission_count == 1
@@ -613,9 +652,7 @@ def test_expired_tombstone_allows_message_to_return() -> None:
     result = simulation.run(
         DirectDelivery(),
         storage_quota=StorageQuota(max_messages=1, max_bytes=128),
-        tombstone_config=TombstoneConfig(
-            max_entries=2, retention_seconds=60
-        ),
+        tombstone_config=TombstoneConfig(max_entries=2, retention_seconds=60),
     )
 
     assert result.transmission_count == 3
@@ -654,9 +691,7 @@ def test_bounded_tombstones_evict_oldest_record() -> None:
     result = simulation.run(
         DirectDelivery(),
         storage_quota=StorageQuota(max_messages=1, max_bytes=128),
-        tombstone_config=TombstoneConfig(
-            max_entries=1, retention_seconds=300
-        ),
+        tombstone_config=TombstoneConfig(max_entries=1, retention_seconds=300),
     )
 
     assert result.transmission_count == 4

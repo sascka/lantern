@@ -183,15 +183,12 @@ class SimulationResult:
     @property
     def duplicate_attempt_count(self) -> int:
         return sum(
-            item.outcome is AttemptOutcome.DUPLICATE_IGNORED
-            for item in self.attempts
+            item.outcome is AttemptOutcome.DUPLICATE_IGNORED for item in self.attempts
         )
 
     @property
     def eviction_count(self) -> int:
-        return sum(
-            item.reason is RemovalReason.QUOTA_EVICTED for item in self.removals
-        )
+        return sum(item.reason is RemovalReason.QUOTA_EVICTED for item in self.removals)
 
     @property
     def quota_rejection_count(self) -> int:
@@ -206,6 +203,40 @@ class SimulationResult:
         if not self.deliveries:
             return None
         return sum(item.delay for item in self.deliveries) / len(self.deliveries)
+
+    def to_summary_dict(self) -> dict[str, object]:
+        return {
+            "attempt_count": self.attempt_count,
+            "average_delivery_delay": self.average_delivery_delay,
+            "blocked_transfer_count": len(self.blocked_transfers),
+            "bytes_attempted": self.bytes_attempted,
+            "bytes_transmitted": self.bytes_transmitted,
+            "delivered_count": self.delivered_count,
+            "delivery_rate": self.delivery_rate,
+            "duplicate_attempt_count": self.duplicate_attempt_count,
+            "eviction_count": self.eviction_count,
+            "lost_attempt_count": self.lost_attempt_count,
+            "message_count": self.message_count,
+            "network_conditions": self.network_conditions.to_dict(),
+            "node_count": self.node_count,
+            "peak_node_stored_bytes": self.peak_node_stored_bytes,
+            "peak_node_stored_messages": self.peak_node_stored_messages,
+            "peak_node_tombstones": self.peak_node_tombstones,
+            "peak_stored_bytes": self.peak_stored_bytes,
+            "peak_stored_messages": self.peak_stored_messages,
+            "policy": self.policy,
+            "policy_parameters": dict(self.policy_parameters),
+            "quota_rejection_count": self.quota_rejection_count,
+            "removal_count": len(self.removals),
+            "scenario": self.scenario,
+            "scenario_parameters": dict(self.scenario_parameters),
+            "seed": self.seed,
+            "storage_quota": self.storage_quota.to_dict(),
+            "tombstone_config": self.tombstone_config.to_dict(),
+            "tombstone_event_count": len(self.tombstone_events),
+            "tombstone_rejection_count": self.tombstone_rejection_count,
+            "transmission_count": self.transmission_count,
+        }
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -313,9 +344,7 @@ class SimulationResult:
                     "receiver_copies_left": transmission.receiver_copies_left,
                     "remaining_ttl": transmission.remaining_ttl,
                     "sender": transmission.sender,
-                    "sender_copies_left_after": (
-                        transmission.sender_copies_left_after
-                    ),
+                    "sender_copies_left_after": (transmission.sender_copies_left_after),
                 }
                 for transmission in self.transmissions
             ],
@@ -361,9 +390,7 @@ class Simulation:
         if isinstance(self._seed, bool) or not isinstance(self._seed, int):
             raise SimulationValidationError("seed must be an integer")
         if not 0 <= self._seed <= MAX_SEED:
-            raise SimulationValidationError(
-                f"seed must be between 0 and {MAX_SEED}"
-            )
+            raise SimulationValidationError(f"seed must be between 0 and {MAX_SEED}")
 
         validate_node_id(self._scenario)
         parameter_names: set[str] = set()
@@ -428,8 +455,7 @@ class Simulation:
         tombstone_settings = tombstone_config or TombstoneConfig()
         states = {node_id: NodeState(node_id) for node_id in self._node_ids}
         tombstones = {
-            node_id: TombstoneStore(tombstone_settings)
-            for node_id in self._node_ids
+            node_id: TombstoneStore(tombstone_settings) for node_id in self._node_ids
         }
         attempts: list[TransferAttempt] = []
         transmissions: list[Transmission] = []
@@ -477,19 +503,22 @@ class Simulation:
         )
         events.sort(key=lambda event: (event[0], event[1], event[2]))
 
+        last_maintenance_at: int | None = None
         for at, event_kind, event_index, event in events:
-            self._purge_tombstones(
-                at=at,
-                tombstones=tombstones,
-                tombstone_events=tombstone_events,
-            )
-            self._remove_expired(
-                at=at,
-                states=states,
-                removals=removals,
-                tombstones=tombstones,
-                tombstone_events=tombstone_events,
-            )
+            if at != last_maintenance_at:
+                self._purge_tombstones(
+                    at=at,
+                    tombstones=tombstones,
+                    tombstone_events=tombstone_events,
+                )
+                self._remove_expired(
+                    at=at,
+                    states=states,
+                    removals=removals,
+                    tombstones=tombstones,
+                    tombstone_events=tombstone_events,
+                )
+                last_maintenance_at = at
 
             if event_kind == 0:
                 if not isinstance(event, Message):

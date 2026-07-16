@@ -27,9 +27,10 @@ from lantern_sim.routing import (
 )
 from lantern_sim.scenarios import (
     DEFAULT_SEED,
+    ContactRoundScenarioConfig,
     MeshScenarioConfig,
+    run_configured_scenario,
     run_three_node_chain,
-    run_uniform_contact_scenario,
 )
 from lantern_sim.tombstones import (
     DEFAULT_MAX_TOMBSTONES,
@@ -44,9 +45,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scenario",
-        choices=("chain", "mesh"),
+        choices=("chain", "mesh", "rounds"),
         default="chain",
-        help="three-node chain or bounded synthetic contact trace",
+        help="three-node chain, sequential contacts or contact rounds",
     )
     parser.add_argument(
         "--policy",
@@ -144,6 +145,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="generated encounter count for the mesh scenario",
     )
     parser.add_argument(
+        "--rounds",
+        type=int,
+        default=40,
+        help="contact round count for the rounds scenario",
+    )
+    parser.add_argument(
         "--summary",
         action="store_true",
         help="omit detailed event arrays from JSON output",
@@ -184,7 +191,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 storage_quota=storage_quota,
                 tombstone_config=tombstone_config,
             )
-        else:
+        elif args.scenario == "mesh":
             scenario_config = MeshScenarioConfig(
                 node_count=args.nodes,
                 message_count=args.messages,
@@ -193,7 +200,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ttl_seconds=args.ttl_seconds,
                 max_hops=args.max_hops,
             )
-            result = run_uniform_contact_scenario(
+            result = run_configured_scenario(
+                policies[args.policy],
+                config=scenario_config,
+                seed=args.seed,
+                network_conditions=network_conditions,
+                storage_quota=storage_quota,
+                tombstone_config=tombstone_config,
+            )
+        else:
+            scenario_config = ContactRoundScenarioConfig(
+                node_count=args.nodes,
+                message_count=args.messages,
+                round_count=args.rounds,
+                payload_size=args.payload_size,
+                ttl_seconds=args.ttl_seconds,
+                max_hops=args.max_hops,
+            )
+            result = run_configured_scenario(
                 policies[args.policy],
                 config=scenario_config,
                 seed=args.seed,
@@ -204,19 +228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (SimulationValidationError, SimulationLimitError) as error:
         parser.error(str(error))
 
-    serialized = result.to_dict()
-    if args.summary:
-        for field_name in (
-            "attempts",
-            "blocked_transfers",
-            "deliveries",
-            "removals",
-            "storage_rejections",
-            "tombstone_events",
-            "tombstone_rejections",
-            "transmissions",
-        ):
-            serialized.pop(field_name)
+    serialized = result.to_summary_dict() if args.summary else result.to_dict()
     print(json.dumps(serialized, indent=2, sort_keys=True))
     return 0
 

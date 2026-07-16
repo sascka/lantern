@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from statistics import fmean, pstdev
 
 from lantern_sim.faults import NetworkConditions
 from lantern_sim.model import (
@@ -14,19 +15,25 @@ from lantern_sim.model import (
     StorageQuota,
 )
 from lantern_sim.routing import RoutingPolicy
-from lantern_sim.scenarios import MeshScenarioConfig, run_uniform_contact_scenario
+from lantern_sim.scenarios import (
+    ContactRoundScenarioConfig,
+    MeshScenarioConfig,
+    ScenarioConfig,
+    configured_scenario_name,
+    run_configured_scenario,
+)
 from lantern_sim.simulation import SimulationResult
 from lantern_sim.tombstones import TombstoneConfig
 
 MAX_BATCH_SEEDS = 10
 MAX_BATCH_SCENARIOS = 4
-MAX_BATCH_RUNS = 60
-BATCH_FORMAT_VERSION = 1
+MAX_BATCH_RUNS = 120
+BATCH_FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
 class BatchExperimentConfig:
-    scenarios: tuple[MeshScenarioConfig, ...]
+    scenarios: tuple[ScenarioConfig, ...]
     seeds: tuple[int, ...]
 
     def __post_init__(self) -> None:
@@ -34,6 +41,16 @@ class BatchExperimentConfig:
             raise SimulationValidationError(
                 "batch scenarios must contain between 1 and "
                 f"{MAX_BATCH_SCENARIOS} entries"
+            )
+        if any(
+            not isinstance(
+                item,
+                (MeshScenarioConfig, ContactRoundScenarioConfig),
+            )
+            for item in self.scenarios
+        ):
+            raise SimulationValidationError(
+                "batch contains an unsupported scenario configuration"
             )
         if len(set(self.scenarios)) != len(self.scenarios):
             raise SimulationValidationError("batch scenarios must be unique")
@@ -58,6 +75,7 @@ class BatchExperimentConfig:
 @dataclass(frozen=True, slots=True)
 class CompactRunResult:
     seed: int
+    scenario: str
     scenario_parameters: tuple[tuple[str, int], ...]
     policy: str
     policy_parameters: tuple[tuple[str, int], ...]
@@ -86,6 +104,7 @@ class CompactRunResult:
     def from_simulation(cls, result: SimulationResult) -> CompactRunResult:
         return cls(
             seed=result.seed,
+            scenario=result.scenario,
             scenario_parameters=result.scenario_parameters,
             policy=result.policy,
             policy_parameters=result.policy_parameters,
@@ -143,6 +162,7 @@ class CompactRunResult:
             "policy_parameters": dict(self.policy_parameters),
             "quota_rejection_count": self.quota_rejection_count,
             "removal_count": self.removal_count,
+            "scenario": self.scenario,
             "scenario_parameters": dict(self.scenario_parameters),
             "seed": self.seed,
             "tombstone_event_count": self.tombstone_event_count,
@@ -154,6 +174,7 @@ class CompactRunResult:
 
 @dataclass(frozen=True, slots=True)
 class AggregateResult:
+    scenario: str
     scenario_parameters: tuple[tuple[str, int], ...]
     policy: str
     policy_parameters: tuple[tuple[str, int], ...]
@@ -178,16 +199,20 @@ class AggregateResult:
     max_peak_node_stored_messages: int
     max_peak_node_stored_bytes: int
     max_peak_node_tombstones: int
+    min_delivery_rate: float
+    max_delivery_rate: float
+    mean_delivery_rate: float
+    delivery_rate_population_stddev: float
+    runs_with_delivery: int
 
     @classmethod
-    def from_runs(
-        cls, runs: tuple[CompactRunResult, ...]
-    ) -> AggregateResult:
+    def from_runs(cls, runs: tuple[CompactRunResult, ...]) -> AggregateResult:
         if not runs:
             raise SimulationValidationError("cannot aggregate an empty run list")
         first = runs[0]
         if any(
-            item.scenario_parameters != first.scenario_parameters
+            item.scenario != first.scenario
+            or item.scenario_parameters != first.scenario_parameters
             or item.policy != first.policy
             or item.policy_parameters != first.policy_parameters
             for item in runs
@@ -196,7 +221,9 @@ class AggregateResult:
                 "aggregate runs must use one scenario and one policy"
             )
 
+        delivery_rates = tuple(item.delivery_rate for item in runs)
         return cls(
+            scenario=first.scenario,
             scenario_parameters=first.scenario_parameters,
             policy=first.policy,
             policy_parameters=first.policy_parameters,
@@ -207,30 +234,18 @@ class AggregateResult:
             total_attempts=sum(item.attempt_count for item in runs),
             total_bytes_attempted=sum(item.bytes_attempted for item in runs),
             total_transmissions=sum(item.transmission_count for item in runs),
-            total_bytes_transmitted=sum(
-                item.bytes_transmitted for item in runs
-            ),
+            total_bytes_transmitted=sum(item.bytes_transmitted for item in runs),
             total_lost_attempts=sum(item.lost_attempt_count for item in runs),
-            total_duplicate_attempts=sum(
-                item.duplicate_attempt_count for item in runs
-            ),
+            total_duplicate_attempts=sum(item.duplicate_attempt_count for item in runs),
             total_removals=sum(item.removal_count for item in runs),
             total_evictions=sum(item.eviction_count for item in runs),
-            total_blocked_transfers=sum(
-                item.blocked_transfer_count for item in runs
-            ),
-            total_quota_rejections=sum(
-                item.quota_rejection_count for item in runs
-            ),
+            total_blocked_transfers=sum(item.blocked_transfer_count for item in runs),
+            total_quota_rejections=sum(item.quota_rejection_count for item in runs),
             total_tombstone_rejections=sum(
                 item.tombstone_rejection_count for item in runs
             ),
-            total_tombstone_events=sum(
-                item.tombstone_event_count for item in runs
-            ),
-            max_peak_stored_messages=max(
-                item.peak_stored_messages for item in runs
-            ),
+            total_tombstone_events=sum(item.tombstone_event_count for item in runs),
+            max_peak_stored_messages=max(item.peak_stored_messages for item in runs),
             max_peak_stored_bytes=max(item.peak_stored_bytes for item in runs),
             max_peak_node_stored_messages=max(
                 item.peak_node_stored_messages for item in runs
@@ -238,9 +253,12 @@ class AggregateResult:
             max_peak_node_stored_bytes=max(
                 item.peak_node_stored_bytes for item in runs
             ),
-            max_peak_node_tombstones=max(
-                item.peak_node_tombstones for item in runs
-            ),
+            max_peak_node_tombstones=max(item.peak_node_tombstones for item in runs),
+            min_delivery_rate=min(delivery_rates),
+            max_delivery_rate=max(delivery_rates),
+            mean_delivery_rate=fmean(delivery_rates),
+            delivery_rate_population_stddev=pstdev(delivery_rates),
+            runs_with_delivery=sum(item.delivered_count > 0 for item in runs),
         )
 
     @property
@@ -253,20 +271,46 @@ class AggregateResult:
             return None
         return self.total_delivery_delay / self.total_delivered
 
+    @property
+    def attempts_per_delivered_message(self) -> float | None:
+        if self.total_delivered == 0:
+            return None
+        return self.total_attempts / self.total_delivered
+
+    @property
+    def bytes_attempted_per_delivered_message(self) -> float | None:
+        if self.total_delivered == 0:
+            return None
+        return self.total_bytes_attempted / self.total_delivered
+
+    @property
+    def transmissions_per_delivered_message(self) -> float | None:
+        if self.total_delivered == 0:
+            return None
+        return self.total_transmissions / self.total_delivered
+
     def to_dict(self) -> dict[str, object]:
         return {
+            "attempts_per_delivered_message": self.attempts_per_delivered_message,
             "average_delivery_delay": self.average_delivery_delay,
-            "delivery_rate": self.delivery_rate,
-            "max_peak_node_stored_bytes": self.max_peak_node_stored_bytes,
-            "max_peak_node_stored_messages": (
-                self.max_peak_node_stored_messages
+            "bytes_attempted_per_delivered_message": (
+                self.bytes_attempted_per_delivered_message
             ),
+            "delivery_rate_population_stddev": (self.delivery_rate_population_stddev),
+            "delivery_rate": self.delivery_rate,
+            "max_delivery_rate": self.max_delivery_rate,
+            "max_peak_node_stored_bytes": self.max_peak_node_stored_bytes,
+            "max_peak_node_stored_messages": (self.max_peak_node_stored_messages),
             "max_peak_node_tombstones": self.max_peak_node_tombstones,
             "max_peak_stored_bytes": self.max_peak_stored_bytes,
             "max_peak_stored_messages": self.max_peak_stored_messages,
+            "mean_delivery_rate": self.mean_delivery_rate,
+            "min_delivery_rate": self.min_delivery_rate,
             "policy": self.policy,
             "policy_parameters": dict(self.policy_parameters),
             "run_count": self.run_count,
+            "runs_with_delivery": self.runs_with_delivery,
+            "scenario": self.scenario,
             "scenario_parameters": dict(self.scenario_parameters),
             "total_attempts": self.total_attempts,
             "total_blocked_transfers": self.total_blocked_transfers,
@@ -283,6 +327,9 @@ class AggregateResult:
             "total_tombstone_events": self.total_tombstone_events,
             "total_tombstone_rejections": self.total_tombstone_rejections,
             "total_transmissions": self.total_transmissions,
+            "transmissions_per_delivered_message": (
+                self.transmissions_per_delivered_message
+            ),
         }
 
 
@@ -302,9 +349,13 @@ class BatchExperimentResult:
             "network_conditions": self.network_conditions.to_dict(),
             "run_count": len(self.runs),
             "runs": [item.to_dict() for item in self.runs],
-            "scenario": "uniform_contacts_batch",
+            "scenario": "routing_batch",
             "scenarios": [
-                dict(item.parameters()) for item in self.config.scenarios
+                {
+                    "scenario": configured_scenario_name(item),
+                    "scenario_parameters": dict(item.parameters()),
+                }
+                for item in self.config.scenarios
             ],
             "seeds": list(self.config.seeds),
             "spdx_license": "MPL-2.0",
@@ -329,9 +380,7 @@ def run_batch_experiment(
 
     run_count = len(config.scenarios) * len(config.seeds) * len(policies)
     if run_count > MAX_BATCH_RUNS:
-        raise SimulationLimitError(
-            f"batch run count must not exceed {MAX_BATCH_RUNS}"
-        )
+        raise SimulationLimitError(f"batch run count must not exceed {MAX_BATCH_RUNS}")
 
     conditions = network_conditions or NetworkConditions()
     quota = storage_quota or StorageQuota()
@@ -341,7 +390,7 @@ def run_batch_experiment(
     for scenario in config.scenarios:
         for seed in config.seeds:
             for policy in policies:
-                result = run_uniform_contact_scenario(
+                result = run_configured_scenario(
                     policy,
                     config=scenario,
                     seed=seed,
@@ -359,7 +408,8 @@ def run_batch_experiment(
             matching_runs = tuple(
                 item
                 for item in compact_runs
-                if item.scenario_parameters == parameters
+                if item.scenario == configured_scenario_name(scenario)
+                and item.scenario_parameters == parameters
                 and item.policy == policy.name
                 and item.policy_parameters == policy.parameters
             )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from lantern_sim.model import (
+    DEFAULT_COPY_BUDGET,
     Message,
     NodeState,
     SimulationValidationError,
@@ -41,6 +42,13 @@ def test_spray_and_wait_accepts_copy_budget_boundaries(copy_budget: int) -> None
 
     assert policy.initial_copies_left == copy_budget
     assert policy.parameters == (("copy_budget", copy_budget),)
+
+
+def test_default_spray_budget_matches_measured_candidate() -> None:
+    policy = BinarySprayAndWait()
+
+    assert DEFAULT_COPY_BUDGET == 32
+    assert policy.initial_copies_left == 32
 
 
 @pytest.mark.parametrize("copy_budget", [0, 65, True])
