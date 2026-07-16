@@ -11,6 +11,7 @@ from lantern_sim.model import (
     Encounter,
     Message,
     MessageIdGenerator,
+    StorageQuota,
 )
 from lantern_sim.routing import RoutingPolicy
 from lantern_sim.simulation import Simulation, SimulationResult
@@ -26,6 +27,7 @@ def run_three_node_chain(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     max_hops: int = DEFAULT_MAX_HOPS,
     network_conditions: NetworkConditions | None = None,
+    storage_quota: StorageQuota | None = None,
 ) -> SimulationResult:
     """Run Alice -> Relay -> Bob with no direct Alice/Bob encounter."""
 
@@ -48,4 +50,8 @@ def run_three_node_chain(
         ),
         seed=seed,
     )
-    return simulation.run(policy, network_conditions)
+    return simulation.run(
+        policy,
+        network_conditions=network_conditions,
+        storage_quota=storage_quota,
+    )

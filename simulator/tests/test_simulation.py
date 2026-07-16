@@ -10,6 +10,8 @@ from lantern_sim.model import (
     Message,
     MessageIdGenerator,
     SimulationValidationError,
+    StorageQuota,
+    StoreOutcome,
 )
 from lantern_sim.routing import BinarySprayAndWait, DirectDelivery, EpidemicRouting
 from lantern_sim.scenarios import run_three_node_chain
@@ -447,3 +449,64 @@ def test_repeated_faulty_runs_are_identical() -> None:
 
     assert first == second
     assert first.to_dict() == second.to_dict()
+
+
+def test_count_quota_evicts_oldest_copy_and_records_reason() -> None:
+    messages = tuple(
+        Message(
+            message_id=f"{index:032x}",
+            source=f"source{index}",
+            destination="relay",
+            created_at=index,
+            payload_size=128,
+        )
+        for index in range(3)
+    )
+    simulation = Simulation(
+        node_ids=("source0", "source1", "source2", "relay"),
+        messages=messages,
+        encounters=(
+            Encounter(at=10, left="source0", right="relay"),
+            Encounter(at=20, left="source1", right="relay"),
+            Encounter(at=30, left="source2", right="relay"),
+        ),
+        seed=42,
+    )
+
+    result = simulation.run(
+        DirectDelivery(),
+        storage_quota=StorageQuota(max_messages=2, max_bytes=1_000),
+    )
+
+    assert result.delivered_count == 3
+    assert result.transmission_count == 3
+    assert result.eviction_count == 1
+    assert result.removals[-1].reason is RemovalReason.QUOTA_EVICTED
+    assert result.removals[-1].node_id == "relay"
+    assert result.removals[-1].message_id == messages[0].message_id
+    assert result.peak_node_stored_messages == 2
+    assert result.peak_node_stored_bytes == 2 * 128
+
+
+def test_item_larger_than_quota_is_rejected_without_network_attempt() -> None:
+    result = run_three_node_chain(
+        EpidemicRouting(),
+        seed=42,
+        payload_size=256,
+        storage_quota=StorageQuota(max_messages=2, max_bytes=128),
+    )
+
+    assert result.delivered_count == 0
+    assert result.attempt_count == 0
+    assert result.transmission_count == 0
+    assert result.eviction_count == 0
+    assert result.quota_rejection_count == 1
+    assert result.storage_rejections[0].reason is (
+        StoreOutcome.ITEM_EXCEEDS_BYTE_QUOTA
+    )
+    assert result.peak_node_stored_messages == 0
+    assert result.peak_node_stored_bytes == 0
+    assert result.to_dict()["storage_quota"] == {
+        "max_bytes": 128,
+        "max_messages": 2,
+    }

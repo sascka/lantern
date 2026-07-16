@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from lantern_sim.model import (
@@ -15,6 +17,8 @@ from lantern_sim.model import (
     MessageIdGenerator,
     NodeState,
     SimulationValidationError,
+    StorageQuota,
+    StoreOutcome,
     StoredMessage,
 )
 
@@ -22,6 +26,7 @@ from lantern_sim.model import (
 def make_message(
     *,
     message_id: str = "0" * 32,
+    created_at: int = 0,
     payload_size: int = 128,
     ttl_seconds: int = 300,
     max_hops: int = 16,
@@ -30,7 +35,7 @@ def make_message(
         message_id=message_id,
         source="alice",
         destination="bob",
-        created_at=0,
+        created_at=created_at,
         payload_size=payload_size,
         ttl_seconds=ttl_seconds,
         max_hops=max_hops,
@@ -167,3 +172,130 @@ def test_node_removes_expired_copy_and_updates_storage() -> None:
     assert tuple(item.message for item in removed) == (message,)
     assert node.message_count == 0
     assert node.stored_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("arguments", "field_name"),
+    [
+        ({"max_messages": 0}, "max_messages"),
+        ({"max_messages": 1_001}, "max_messages"),
+        ({"max_bytes": 0}, "max_bytes"),
+        ({"max_bytes": 64 * 1024 * 1024 + 1}, "max_bytes"),
+        ({"max_messages": True}, "max_messages"),
+    ],
+)
+def test_storage_quota_rejects_invalid_limits(
+    arguments: dict[str, object], field_name: str
+) -> None:
+    with pytest.raises(SimulationValidationError, match=field_name):
+        StorageQuota(**arguments)  # type: ignore[arg-type]
+
+
+def test_fifo_eviction_removes_oldest_local_copy() -> None:
+    node = NodeState("relay")
+    quota = StorageQuota(max_messages=2, max_bytes=1_000)
+    oldest = make_message(message_id="0" * 32, created_at=0)
+    newer = make_message(message_id="1" * 32, created_at=1)
+    incoming = make_message(message_id="2" * 32, created_at=2)
+
+    node.store_origin_with_eviction(oldest, copies_left=None, quota=quota)
+    node.store_origin_with_eviction(newer, copies_left=None, quota=quota)
+    result = node.store_origin_with_eviction(
+        incoming, copies_left=None, quota=quota
+    )
+
+    assert result.outcome is StoreOutcome.STORED
+    assert tuple(item.message for item in result.evicted) == (oldest,)
+    assert node.has_message(oldest.message_id) is False
+    assert node.has_message(newer.message_id) is True
+    assert node.has_message(incoming.message_id) is True
+    assert node.message_count == 2
+
+
+def test_fifo_eviction_uses_message_id_as_deterministic_tiebreaker() -> None:
+    node = NodeState("relay")
+    quota = StorageQuota(max_messages=2, max_bytes=1_000)
+    high_id = make_message(message_id="f" * 32, created_at=0)
+    low_id = make_message(message_id="0" * 32, created_at=0)
+    incoming = make_message(message_id="1" * 32, created_at=1)
+    node.store_origin_with_eviction(high_id, copies_left=None, quota=quota)
+    node.store_origin_with_eviction(low_id, copies_left=None, quota=quota)
+
+    result = node.store_origin_with_eviction(
+        incoming, copies_left=None, quota=quota
+    )
+
+    assert tuple(item.message for item in result.evicted) == (low_id,)
+    assert node.has_message(high_id.message_id) is True
+    assert node.has_message(incoming.message_id) is True
+
+
+def test_byte_quota_can_evict_multiple_copies_atomically() -> None:
+    node = NodeState("relay")
+    quota = StorageQuota(max_messages=10, max_bytes=200)
+    first = make_message(message_id="0" * 32, payload_size=80, created_at=0)
+    second = make_message(message_id="1" * 32, payload_size=80, created_at=1)
+    incoming = make_message(message_id="2" * 32, payload_size=150, created_at=2)
+
+    node.store_origin_with_eviction(first, copies_left=None, quota=quota)
+    node.store_origin_with_eviction(second, copies_left=None, quota=quota)
+    result = node.store_origin_with_eviction(
+        incoming, copies_left=None, quota=quota
+    )
+
+    assert tuple(item.message for item in result.evicted) == (first, second)
+    assert node.messages()[0].message == incoming
+    assert node.message_count == 1
+    assert node.stored_bytes == 150
+
+
+def test_oversized_item_is_rejected_without_evicting_existing_copy() -> None:
+    node = NodeState("relay")
+    quota = StorageQuota(max_messages=2, max_bytes=200)
+    existing = make_message(message_id="0" * 32, payload_size=80)
+    oversized = make_message(message_id="1" * 32, payload_size=201)
+    node.store_origin_with_eviction(existing, copies_left=None, quota=quota)
+
+    result = node.store_origin_with_eviction(
+        oversized, copies_left=None, quota=quota
+    )
+
+    assert result.outcome is StoreOutcome.ITEM_EXCEEDS_BYTE_QUOTA
+    assert result.evicted == ()
+    assert tuple(item.message for item in node.messages()) == (existing,)
+    assert node.stored_bytes == 80
+
+
+def test_duplicate_does_not_trigger_eviction() -> None:
+    node = NodeState("relay")
+    quota = StorageQuota(max_messages=1, max_bytes=128)
+    message = make_message()
+    node.store_origin_with_eviction(message, copies_left=None, quota=quota)
+
+    result = node.store_origin_with_eviction(
+        message, copies_left=None, quota=quota
+    )
+
+    assert result.outcome is StoreOutcome.DUPLICATE
+    assert result.evicted == ()
+    assert node.message_count == 1
+
+
+def test_quota_holds_after_reproducible_sequence_of_varied_sizes() -> None:
+    random_generator = random.Random(20_260_716)
+    node = NodeState("relay")
+    quota = StorageQuota(max_messages=7, max_bytes=500)
+
+    for index in range(100):
+        message = make_message(
+            message_id=f"{index:032x}",
+            created_at=index,
+            payload_size=random_generator.randint(1, 200),
+        )
+        result = node.store_origin_with_eviction(
+            message, copies_left=None, quota=quota
+        )
+
+        assert result.outcome is StoreOutcome.STORED
+        assert node.message_count <= quota.max_messages
+        assert node.stored_bytes <= quota.max_bytes

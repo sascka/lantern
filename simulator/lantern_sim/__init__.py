@@ -8,6 +8,9 @@ from lantern_sim.model import (
     Message,
     MessageIdGenerator,
     NodeState,
+    StorageQuota,
+    StoreOutcome,
+    StoreResult,
     StoredMessage,
 )
 from lantern_sim.routing import (
@@ -23,6 +26,7 @@ from lantern_sim.simulation import (
     RemovalReason,
     Simulation,
     SimulationResult,
+    StorageRejection,
     TransferAttempt,
 )
 
@@ -42,6 +46,10 @@ __all__ = [
     "RoutingPolicy",
     "Simulation",
     "SimulationResult",
+    "StorageQuota",
+    "StorageRejection",
+    "StoreOutcome",
+    "StoreResult",
     "StoredMessage",
     "TransferAttempt",
 ]

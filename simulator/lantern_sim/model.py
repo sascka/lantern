@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 import random
 import re
 
@@ -34,6 +35,50 @@ class SimulationValidationError(ValueError):
 
 class SimulationLimitError(RuntimeError):
     """Raised when a safety limit would be exceeded."""
+
+
+class StoreOutcome(str, Enum):
+    STORED = "stored"
+    DUPLICATE = "duplicate"
+    ITEM_EXCEEDS_BYTE_QUOTA = "item_exceeds_byte_quota"
+
+
+@dataclass(frozen=True, slots=True)
+class StorageQuota:
+    """Per-node limits used by the simulated store."""
+
+    max_messages: int = MAX_STORED_MESSAGES_PER_NODE
+    max_bytes: int = MAX_STORED_BYTES_PER_NODE
+
+    def __post_init__(self) -> None:
+        _validate_bounded_integer(
+            self.max_messages,
+            field_name="max_messages",
+            minimum=1,
+            maximum=MAX_STORED_MESSAGES_PER_NODE,
+        )
+        _validate_bounded_integer(
+            self.max_bytes,
+            field_name="max_bytes",
+            minimum=1,
+            maximum=MAX_STORED_BYTES_PER_NODE,
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "max_bytes": self.max_bytes,
+            "max_messages": self.max_messages,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class StoreResult:
+    outcome: StoreOutcome
+    evicted: tuple[StoredMessage, ...]
+
+    @property
+    def stored(self) -> bool:
+        return self.outcome is StoreOutcome.STORED
 
 
 def validate_node_id(node_id: str) -> None:
@@ -289,6 +334,22 @@ class NodeState:
     def store_forwarded(self, stored_message: StoredMessage) -> bool:
         return self._store(stored_message)
 
+    def store_origin_with_eviction(
+        self,
+        message: Message,
+        *,
+        copies_left: int | None,
+        quota: StorageQuota,
+    ) -> StoreResult:
+        return self._store_with_eviction(
+            StoredMessage.from_origin(message, copies_left=copies_left), quota
+        )
+
+    def store_forwarded_with_eviction(
+        self, stored_message: StoredMessage, *, quota: StorageQuota
+    ) -> StoreResult:
+        return self._store_with_eviction(stored_message, quota)
+
     def _store(self, stored_message: StoredMessage) -> bool:
         message = stored_message.message
         existing = self._messages.get(message.message_id)
@@ -311,6 +372,54 @@ class NodeState:
         self._messages[message.message_id] = stored_message
         self._stored_bytes += message.payload_size
         return True
+
+    def _store_with_eviction(
+        self, stored_message: StoredMessage, quota: StorageQuota
+    ) -> StoreResult:
+        message = stored_message.message
+        existing = self._messages.get(message.message_id)
+        if existing is not None:
+            if existing.message != message:
+                raise SimulationValidationError(
+                    "the same message_id refers to different message metadata"
+                )
+            return StoreResult(StoreOutcome.DUPLICATE, ())
+
+        if message.payload_size > quota.max_bytes:
+            return StoreResult(StoreOutcome.ITEM_EXCEEDS_BYTE_QUOTA, ())
+
+        candidates = sorted(
+            self._messages.values(),
+            key=lambda item: (item.received_at, item.message.message_id),
+        )
+        evicted: list[StoredMessage] = []
+        remaining_count = self.message_count
+        remaining_bytes = self._stored_bytes
+
+        for candidate in candidates:
+            count_fits = remaining_count + 1 <= quota.max_messages
+            bytes_fit = remaining_bytes + message.payload_size <= quota.max_bytes
+            if count_fits and bytes_fit:
+                break
+            evicted.append(candidate)
+            remaining_count -= 1
+            remaining_bytes -= candidate.message.payload_size
+
+        count_fits = remaining_count + 1 <= quota.max_messages
+        bytes_fit = remaining_bytes + message.payload_size <= quota.max_bytes
+        if not count_fits or not bytes_fit:
+            raise AssertionError("validated storage quota could not fit one item")
+
+        for candidate in evicted:
+            removed = self.remove(candidate.message.message_id)
+            if removed != candidate:
+                raise SimulationValidationError(
+                    "eviction candidate changed before it could be removed"
+                )
+
+        self._messages[message.message_id] = stored_message
+        self._stored_bytes += message.payload_size
+        return StoreResult(StoreOutcome.STORED, tuple(evicted))
 
     def remove(self, message_id: str) -> StoredMessage | None:
         stored_message = self._messages.pop(message_id, None)

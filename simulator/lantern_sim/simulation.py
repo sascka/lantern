@@ -14,6 +14,9 @@ from lantern_sim.model import (
     Message,
     NodeState,
     SimulationValidationError,
+    StorageQuota,
+    StoreOutcome,
+    StoreResult,
     validate_node_id,
 )
 from lantern_sim.routing import ForwardingDecision, RoutingPolicy
@@ -26,6 +29,7 @@ MAX_SEED: Final = (1 << 64) - 1
 
 class RemovalReason(str, Enum):
     TTL_EXPIRED = "ttl_expired"
+    QUOTA_EVICTED = "quota_evicted"
 
 
 class BlockReason(str, Enum):
@@ -37,6 +41,7 @@ class AttemptOutcome(str, Enum):
     STORED = "stored"
     LOST = "lost"
     DUPLICATE_IGNORED = "duplicate_ignored"
+    QUOTA_REJECTED = "quota_rejected"
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,20 +92,32 @@ class BlockedTransfer:
 
 
 @dataclass(frozen=True, slots=True)
+class StorageRejection:
+    at: int
+    node_id: str
+    message_id: str
+    reason: StoreOutcome
+
+
+@dataclass(frozen=True, slots=True)
 class SimulationResult:
     seed: int
     policy: str
     policy_parameters: tuple[tuple[str, int], ...]
     network_conditions: NetworkConditions
+    storage_quota: StorageQuota
     node_count: int
     message_count: int
     attempts: tuple[TransferAttempt, ...]
     transmissions: tuple[Transmission, ...]
     deliveries: tuple[Delivery, ...]
     removals: tuple[Removal, ...]
+    storage_rejections: tuple[StorageRejection, ...]
     blocked_transfers: tuple[BlockedTransfer, ...]
     peak_stored_messages: int
     peak_stored_bytes: int
+    peak_node_stored_messages: int
+    peak_node_stored_bytes: int
 
     @property
     def delivered_count(self) -> int:
@@ -138,6 +155,16 @@ class SimulationResult:
             item.outcome is AttemptOutcome.DUPLICATE_IGNORED
             for item in self.attempts
         )
+
+    @property
+    def eviction_count(self) -> int:
+        return sum(
+            item.reason is RemovalReason.QUOTA_EVICTED for item in self.removals
+        )
+
+    @property
+    def quota_rejection_count(self) -> int:
+        return len(self.storage_rejections)
 
     @property
     def average_delivery_delay(self) -> float | None:
@@ -184,12 +211,15 @@ class SimulationResult:
             ],
             "delivery_rate": self.delivery_rate,
             "duplicate_attempt_count": self.duplicate_attempt_count,
+            "eviction_count": self.eviction_count,
             "lost_attempt_count": self.lost_attempt_count,
             "message_count": self.message_count,
             "node_count": self.node_count,
             "network_conditions": self.network_conditions.to_dict(),
             "peak_stored_bytes": self.peak_stored_bytes,
             "peak_stored_messages": self.peak_stored_messages,
+            "peak_node_stored_bytes": self.peak_node_stored_bytes,
+            "peak_node_stored_messages": self.peak_node_stored_messages,
             "policy": self.policy,
             "policy_parameters": dict(self.policy_parameters),
             "removal_count": len(self.removals),
@@ -202,7 +232,18 @@ class SimulationResult:
                 }
                 for removal in self.removals
             ],
+            "quota_rejection_count": self.quota_rejection_count,
             "seed": self.seed,
+            "storage_quota": self.storage_quota.to_dict(),
+            "storage_rejections": [
+                {
+                    "at": rejection.at,
+                    "message_id": rejection.message_id,
+                    "node_id": rejection.node_id,
+                    "reason": rejection.reason.value,
+                }
+                for rejection in self.storage_rejections
+            ],
             "transmission_count": self.transmission_count,
             "transmissions": [
                 {
@@ -299,23 +340,37 @@ class Simulation:
         self,
         policy: RoutingPolicy,
         network_conditions: NetworkConditions | None = None,
+        storage_quota: StorageQuota | None = None,
     ) -> SimulationResult:
         conditions = network_conditions or NetworkConditions()
+        quota = storage_quota or StorageQuota()
         states = {node_id: NodeState(node_id) for node_id in self._node_ids}
         attempts: list[TransferAttempt] = []
         transmissions: list[Transmission] = []
         removals: list[Removal] = []
+        storage_rejections: list[StorageRejection] = []
         blocked_transfers: list[BlockedTransfer] = []
         delivered_at: dict[str, int] = {}
         peak_stored_messages = 0
         peak_stored_bytes = 0
+        peak_node_stored_messages = 0
+        peak_node_stored_bytes = 0
 
         def update_peaks() -> None:
             nonlocal peak_stored_messages, peak_stored_bytes
+            nonlocal peak_node_stored_messages, peak_node_stored_bytes
             stored_messages = sum(state.message_count for state in states.values())
             stored_bytes = sum(state.stored_bytes for state in states.values())
             peak_stored_messages = max(peak_stored_messages, stored_messages)
             peak_stored_bytes = max(peak_stored_bytes, stored_bytes)
+            peak_node_stored_messages = max(
+                peak_node_stored_messages,
+                max(state.message_count for state in states.values()),
+            )
+            peak_node_stored_bytes = max(
+                peak_node_stored_bytes,
+                max(state.stored_bytes for state in states.values()),
+            )
 
         events: list[tuple[int, int, int, Message | Encounter]] = []
         events.extend(
@@ -334,8 +389,18 @@ class Simulation:
             if event_kind == 0:
                 if not isinstance(event, Message):
                     raise AssertionError("message event has an invalid type")
-                states[event.source].store_origin(
-                    event, copies_left=policy.initial_copies_left
+                store_result = states[event.source].store_origin_with_eviction(
+                    event,
+                    copies_left=policy.initial_copies_left,
+                    quota=quota,
+                )
+                self._record_store_result(
+                    at=at,
+                    node_id=event.source,
+                    message_id=event.message_id,
+                    result=store_result,
+                    removals=removals,
+                    storage_rejections=storage_rejections,
                 )
                 update_peaks()
                 continue
@@ -347,9 +412,6 @@ class Simulation:
             right = states[event.right]
             left_to_right = conditions.order_batch(
                 policy.forwarding_decisions(left, right)
-            )
-            right_to_left = conditions.order_batch(
-                policy.forwarding_decisions(right, left)
             )
 
             self._transfer(
@@ -363,7 +425,15 @@ class Simulation:
                 delivered_at=delivered_at,
                 blocked_transfers=blocked_transfers,
                 network_conditions=conditions,
+                storage_quota=quota,
+                removals=removals,
+                storage_rejections=storage_rejections,
                 seed=self._seed,
+            )
+            update_peaks()
+
+            right_to_left = conditions.order_batch(
+                policy.forwarding_decisions(right, left)
             )
             self._transfer(
                 at=at,
@@ -376,6 +446,9 @@ class Simulation:
                 delivered_at=delivered_at,
                 blocked_transfers=blocked_transfers,
                 network_conditions=conditions,
+                storage_quota=quota,
+                removals=removals,
+                storage_rejections=storage_rejections,
                 seed=self._seed,
             )
             update_peaks()
@@ -395,16 +468,49 @@ class Simulation:
             policy=policy.name,
             policy_parameters=policy.parameters,
             network_conditions=conditions,
+            storage_quota=quota,
             node_count=len(states),
             message_count=len(self._messages),
             attempts=tuple(attempts),
             transmissions=tuple(transmissions),
             deliveries=deliveries,
             removals=tuple(removals),
+            storage_rejections=tuple(storage_rejections),
             blocked_transfers=tuple(blocked_transfers),
             peak_stored_messages=peak_stored_messages,
             peak_stored_bytes=peak_stored_bytes,
+            peak_node_stored_messages=peak_node_stored_messages,
+            peak_node_stored_bytes=peak_node_stored_bytes,
         )
+
+    @staticmethod
+    def _record_store_result(
+        *,
+        at: int,
+        node_id: str,
+        message_id: str,
+        result: StoreResult,
+        removals: list[Removal],
+        storage_rejections: list[StorageRejection],
+    ) -> None:
+        for evicted in result.evicted:
+            removals.append(
+                Removal(
+                    at=at,
+                    node_id=node_id,
+                    message_id=evicted.message.message_id,
+                    reason=RemovalReason.QUOTA_EVICTED,
+                )
+            )
+        if result.outcome is StoreOutcome.ITEM_EXCEEDS_BYTE_QUOTA:
+            storage_rejections.append(
+                StorageRejection(
+                    at=at,
+                    node_id=node_id,
+                    message_id=message_id,
+                    reason=result.outcome,
+                )
+            )
 
     @staticmethod
     def _remove_expired(
@@ -437,6 +543,9 @@ class Simulation:
         delivered_at: dict[str, int],
         blocked_transfers: list[BlockedTransfer],
         network_conditions: NetworkConditions,
+        storage_quota: StorageQuota,
+        removals: list[Removal],
+        storage_rejections: list[StorageRejection],
         seed: int,
     ) -> None:
         for decision in messages:
@@ -497,7 +606,10 @@ class Simulation:
                 )
                 continue
 
-            if not receiver.store_forwarded(forwarded_copy):
+            store_result = receiver.store_forwarded_with_eviction(
+                forwarded_copy, quota=storage_quota
+            )
+            if store_result.outcome is StoreOutcome.DUPLICATE:
                 attempts.append(
                     TransferAttempt(
                         at=at,
@@ -509,6 +621,35 @@ class Simulation:
                     )
                 )
                 continue
+            if not store_result.stored:
+                attempts.append(
+                    TransferAttempt(
+                        at=at,
+                        sender=sender.node_id,
+                        receiver=receiver.node_id,
+                        message_id=message.message_id,
+                        payload_size=message.payload_size,
+                        outcome=AttemptOutcome.QUOTA_REJECTED,
+                    )
+                )
+                Simulation._record_store_result(
+                    at=at,
+                    node_id=receiver.node_id,
+                    message_id=message.message_id,
+                    result=store_result,
+                    removals=removals,
+                    storage_rejections=storage_rejections,
+                )
+                continue
+
+            Simulation._record_store_result(
+                at=at,
+                node_id=receiver.node_id,
+                message_id=message.message_id,
+                result=store_result,
+                removals=removals,
+                storage_rejections=storage_rejections,
+            )
 
             attempts.append(
                 TransferAttempt(

@@ -13,8 +13,11 @@ from lantern_sim.model import (
     DEFAULT_COPY_BUDGET,
     DEFAULT_MAX_HOPS,
     DEFAULT_TTL_SECONDS,
+    MAX_STORED_BYTES_PER_NODE,
+    MAX_STORED_MESSAGES_PER_NODE,
     SimulationLimitError,
     SimulationValidationError,
+    StorageQuota,
 )
 from lantern_sim.routing import (
     BinarySprayAndWait,
@@ -82,6 +85,18 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="reverse each batch of messages selected during an encounter",
     )
+    parser.add_argument(
+        "--max-stored-messages",
+        type=int,
+        default=MAX_STORED_MESSAGES_PER_NODE,
+        help="maximum stored copies per simulated node",
+    )
+    parser.add_argument(
+        "--max-stored-bytes",
+        type=int,
+        default=MAX_STORED_BYTES_PER_NODE,
+        help="maximum bytes of stored copies per simulated node",
+    )
     return parser
 
 
@@ -99,6 +114,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             duplicate_percent=args.duplicate_percent,
             reorder=args.reorder,
         )
+        storage_quota = StorageQuota(
+            max_messages=args.max_stored_messages,
+            max_bytes=args.max_stored_bytes,
+        )
         result = run_three_node_chain(
             policies[args.policy],
             seed=args.seed,
@@ -106,6 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ttl_seconds=args.ttl_seconds,
             max_hops=args.max_hops,
             network_conditions=network_conditions,
+            storage_quota=storage_quota,
         )
     except (SimulationValidationError, SimulationLimitError) as error:
         parser.error(str(error))
