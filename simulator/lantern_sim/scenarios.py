@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from lantern_sim.faults import NetworkConditions
 from lantern_sim.model import (
     DEFAULT_MAX_HOPS,
     DEFAULT_TTL_SECONDS,
@@ -24,6 +25,7 @@ def run_three_node_chain(
     payload_size: int = 256,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     max_hops: int = DEFAULT_MAX_HOPS,
+    network_conditions: NetworkConditions | None = None,
 ) -> SimulationResult:
     """Run Alice -> Relay -> Bob with no direct Alice/Bob encounter."""
 
@@ -46,4 +48,4 @@ def run_three_node_chain(
         ),
         seed=seed,
     )
-    return simulation.run(policy)
+    return simulation.run(policy, network_conditions)

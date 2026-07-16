@@ -2,6 +2,7 @@
 
 """Deterministic routing simulator for Lantern."""
 
+from lantern_sim.faults import NetworkConditions
 from lantern_sim.model import (
     Encounter,
     Message,
@@ -17,25 +18,30 @@ from lantern_sim.routing import (
     RoutingPolicy,
 )
 from lantern_sim.simulation import (
+    AttemptOutcome,
     BlockReason,
     RemovalReason,
     Simulation,
     SimulationResult,
+    TransferAttempt,
 )
 
 __all__ = [
-    "DirectDelivery",
+    "AttemptOutcome",
     "BinarySprayAndWait",
     "BlockReason",
+    "DirectDelivery",
     "Encounter",
     "EpidemicRouting",
     "ForwardingDecision",
     "Message",
     "MessageIdGenerator",
+    "NetworkConditions",
     "NodeState",
     "RemovalReason",
     "RoutingPolicy",
     "Simulation",
     "SimulationResult",
     "StoredMessage",
+    "TransferAttempt",
 ]

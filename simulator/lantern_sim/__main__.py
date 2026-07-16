@@ -8,6 +8,7 @@ import argparse
 import json
 from collections.abc import Sequence
 
+from lantern_sim.faults import NetworkConditions
 from lantern_sim.model import (
     DEFAULT_COPY_BUDGET,
     DEFAULT_MAX_HOPS,
@@ -64,6 +65,23 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_COPY_BUDGET,
         help="initial copy-token budget for Spray-and-Wait",
     )
+    parser.add_argument(
+        "--loss-percent",
+        type=int,
+        default=0,
+        help="deterministic percentage of transfer attempts to lose",
+    )
+    parser.add_argument(
+        "--duplicate-percent",
+        type=int,
+        default=0,
+        help="deterministic percentage of stored transfers to duplicate",
+    )
+    parser.add_argument(
+        "--reorder",
+        action="store_true",
+        help="reverse each batch of messages selected during an encounter",
+    )
     return parser
 
 
@@ -76,12 +94,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "epidemic": EpidemicRouting(),
             "spray": BinarySprayAndWait(args.copy_budget),
         }
+        network_conditions = NetworkConditions(
+            loss_percent=args.loss_percent,
+            duplicate_percent=args.duplicate_percent,
+            reorder=args.reorder,
+        )
         result = run_three_node_chain(
             policies[args.policy],
             seed=args.seed,
             payload_size=args.payload_size,
             ttl_seconds=args.ttl_seconds,
             max_hops=args.max_hops,
+            network_conditions=network_conditions,
         )
     except (SimulationValidationError, SimulationLimitError) as error:
         parser.error(str(error))

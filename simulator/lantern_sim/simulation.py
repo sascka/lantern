@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Final
 
+from lantern_sim.faults import NetworkConditions
 from lantern_sim.model import (
     Encounter,
     Message,
@@ -30,6 +31,22 @@ class RemovalReason(str, Enum):
 class BlockReason(str, Enum):
     HOP_LIMIT_EXCEEDED = "hop_limit_exceeded"
     HOP_LIMIT_BEFORE_DESTINATION = "hop_limit_before_destination"
+
+
+class AttemptOutcome(str, Enum):
+    STORED = "stored"
+    LOST = "lost"
+    DUPLICATE_IGNORED = "duplicate_ignored"
+
+
+@dataclass(frozen=True, slots=True)
+class TransferAttempt:
+    at: int
+    sender: str
+    receiver: str
+    message_id: str
+    payload_size: int
+    outcome: AttemptOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,8 +91,10 @@ class SimulationResult:
     seed: int
     policy: str
     policy_parameters: tuple[tuple[str, int], ...]
+    network_conditions: NetworkConditions
     node_count: int
     message_count: int
+    attempts: tuple[TransferAttempt, ...]
     transmissions: tuple[Transmission, ...]
     deliveries: tuple[Delivery, ...]
     removals: tuple[Removal, ...]
@@ -98,8 +117,27 @@ class SimulationResult:
         return len(self.transmissions)
 
     @property
+    def attempt_count(self) -> int:
+        return len(self.attempts)
+
+    @property
     def bytes_transmitted(self) -> int:
         return sum(item.payload_size for item in self.transmissions)
+
+    @property
+    def bytes_attempted(self) -> int:
+        return sum(item.payload_size for item in self.attempts)
+
+    @property
+    def lost_attempt_count(self) -> int:
+        return sum(item.outcome is AttemptOutcome.LOST for item in self.attempts)
+
+    @property
+    def duplicate_attempt_count(self) -> int:
+        return sum(
+            item.outcome is AttemptOutcome.DUPLICATE_IGNORED
+            for item in self.attempts
+        )
 
     @property
     def average_delivery_delay(self) -> float | None:
@@ -109,6 +147,18 @@ class SimulationResult:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "attempt_count": self.attempt_count,
+            "attempts": [
+                {
+                    "at": attempt.at,
+                    "message_id": attempt.message_id,
+                    "outcome": attempt.outcome.value,
+                    "payload_size": attempt.payload_size,
+                    "receiver": attempt.receiver,
+                    "sender": attempt.sender,
+                }
+                for attempt in self.attempts
+            ],
             "average_delivery_delay": self.average_delivery_delay,
             "blocked_transfer_count": len(self.blocked_transfers),
             "blocked_transfers": [
@@ -122,6 +172,7 @@ class SimulationResult:
                 for blocked in self.blocked_transfers
             ],
             "bytes_transmitted": self.bytes_transmitted,
+            "bytes_attempted": self.bytes_attempted,
             "delivered_count": self.delivered_count,
             "deliveries": [
                 {
@@ -132,8 +183,11 @@ class SimulationResult:
                 for delivery in self.deliveries
             ],
             "delivery_rate": self.delivery_rate,
+            "duplicate_attempt_count": self.duplicate_attempt_count,
+            "lost_attempt_count": self.lost_attempt_count,
             "message_count": self.message_count,
             "node_count": self.node_count,
+            "network_conditions": self.network_conditions.to_dict(),
             "peak_stored_bytes": self.peak_stored_bytes,
             "peak_stored_messages": self.peak_stored_messages,
             "policy": self.policy,
@@ -241,8 +295,14 @@ class Simulation:
                     f"unknown encounter node: {encounter.right!r}"
                 )
 
-    def run(self, policy: RoutingPolicy) -> SimulationResult:
+    def run(
+        self,
+        policy: RoutingPolicy,
+        network_conditions: NetworkConditions | None = None,
+    ) -> SimulationResult:
+        conditions = network_conditions or NetworkConditions()
         states = {node_id: NodeState(node_id) for node_id in self._node_ids}
+        attempts: list[TransferAttempt] = []
         transmissions: list[Transmission] = []
         removals: list[Removal] = []
         blocked_transfers: list[BlockedTransfer] = []
@@ -268,7 +328,7 @@ class Simulation:
         )
         events.sort(key=lambda event: (event[0], event[1], event[2]))
 
-        for at, event_kind, _, event in events:
+        for at, event_kind, event_index, event in events:
             self._remove_expired(at=at, states=states, removals=removals)
 
             if event_kind == 0:
@@ -285,26 +345,38 @@ class Simulation:
 
             left = states[event.left]
             right = states[event.right]
-            left_to_right = policy.forwarding_decisions(left, right)
-            right_to_left = policy.forwarding_decisions(right, left)
+            left_to_right = conditions.order_batch(
+                policy.forwarding_decisions(left, right)
+            )
+            right_to_left = conditions.order_batch(
+                policy.forwarding_decisions(right, left)
+            )
 
             self._transfer(
                 at=at,
+                encounter_index=event_index,
                 sender=left,
                 receiver=right,
                 messages=left_to_right,
+                attempts=attempts,
                 transmissions=transmissions,
                 delivered_at=delivered_at,
                 blocked_transfers=blocked_transfers,
+                network_conditions=conditions,
+                seed=self._seed,
             )
             self._transfer(
                 at=at,
+                encounter_index=event_index,
                 sender=right,
                 receiver=left,
                 messages=right_to_left,
+                attempts=attempts,
                 transmissions=transmissions,
                 delivered_at=delivered_at,
                 blocked_transfers=blocked_transfers,
+                network_conditions=conditions,
+                seed=self._seed,
             )
             update_peaks()
 
@@ -322,8 +394,10 @@ class Simulation:
             seed=self._seed,
             policy=policy.name,
             policy_parameters=policy.parameters,
+            network_conditions=conditions,
             node_count=len(states),
             message_count=len(self._messages),
+            attempts=tuple(attempts),
             transmissions=tuple(transmissions),
             deliveries=deliveries,
             removals=tuple(removals),
@@ -354,12 +428,16 @@ class Simulation:
     def _transfer(
         *,
         at: int,
+        encounter_index: int,
         sender: NodeState,
         receiver: NodeState,
         messages: tuple[ForwardingDecision, ...],
+        attempts: list[TransferAttempt],
         transmissions: list[Transmission],
         delivered_at: dict[str, int],
         blocked_transfers: list[BlockedTransfer],
+        network_conditions: NetworkConditions,
+        seed: int,
     ) -> None:
         for decision in messages:
             stored_message = decision.stored_message
@@ -400,8 +478,48 @@ class Simulation:
             forwarded_copy = stored_message.forwarded_copy(
                 at, copies_left=decision.receiver_copies_left
             )
-            if not receiver.store_forwarded(forwarded_copy):
+            if network_conditions.is_lost(
+                seed=seed,
+                encounter_index=encounter_index,
+                sender=sender.node_id,
+                receiver=receiver.node_id,
+                message_id=message.message_id,
+            ):
+                attempts.append(
+                    TransferAttempt(
+                        at=at,
+                        sender=sender.node_id,
+                        receiver=receiver.node_id,
+                        message_id=message.message_id,
+                        payload_size=message.payload_size,
+                        outcome=AttemptOutcome.LOST,
+                    )
+                )
                 continue
+
+            if not receiver.store_forwarded(forwarded_copy):
+                attempts.append(
+                    TransferAttempt(
+                        at=at,
+                        sender=sender.node_id,
+                        receiver=receiver.node_id,
+                        message_id=message.message_id,
+                        payload_size=message.payload_size,
+                        outcome=AttemptOutcome.DUPLICATE_IGNORED,
+                    )
+                )
+                continue
+
+            attempts.append(
+                TransferAttempt(
+                    at=at,
+                    sender=sender.node_id,
+                    receiver=receiver.node_id,
+                    message_id=message.message_id,
+                    payload_size=message.payload_size,
+                    outcome=AttemptOutcome.STORED,
+                )
+            )
 
             sender_copies_after = decision.sender_copies_left_after
             if sender_copies_after == 0:
@@ -428,3 +546,25 @@ class Simulation:
             )
             if receiver.node_id == message.destination:
                 delivered_at.setdefault(message.message_id, at)
+
+            if network_conditions.is_duplicated(
+                seed=seed,
+                encounter_index=encounter_index,
+                sender=sender.node_id,
+                receiver=receiver.node_id,
+                message_id=message.message_id,
+            ):
+                if receiver.store_forwarded(forwarded_copy):
+                    raise SimulationValidationError(
+                        "duplicate transfer unexpectedly created a second copy"
+                    )
+                attempts.append(
+                    TransferAttempt(
+                        at=at,
+                        sender=sender.node_id,
+                        receiver=receiver.node_id,
+                        message_id=message.message_id,
+                        payload_size=message.payload_size,
+                        outcome=AttemptOutcome.DUPLICATE_IGNORED,
+                    )
+                )

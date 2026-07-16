@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from lantern_sim.faults import NetworkConditions
 from lantern_sim.model import (
     Encounter,
     Message,
@@ -12,18 +13,24 @@ from lantern_sim.model import (
 )
 from lantern_sim.routing import BinarySprayAndWait, DirectDelivery, EpidemicRouting
 from lantern_sim.scenarios import run_three_node_chain
-from lantern_sim.simulation import BlockReason, RemovalReason, Simulation
+from lantern_sim.simulation import (
+    AttemptOutcome,
+    BlockReason,
+    RemovalReason,
+    Simulation,
+)
 
 
 def make_message(
     *,
+    message_id: str | None = None,
     created_at: int = 0,
     payload_size: int = 128,
     ttl_seconds: int = 300,
     max_hops: int = 16,
 ) -> Message:
     return Message(
-        message_id=MessageIdGenerator(42).next_id(),
+        message_id=message_id or MessageIdGenerator(42).next_id(),
         source="alice",
         destination="bob",
         created_at=created_at,
@@ -317,3 +324,126 @@ def test_result_serializes_spray_policy_parameters() -> None:
 
     assert serialized["policy"] == "spray_and_wait"
     assert serialized["policy_parameters"] == {"copy_budget": 2}
+
+
+def test_total_loss_records_attempt_without_storing_copy() -> None:
+    result = run_three_node_chain(
+        EpidemicRouting(),
+        seed=42,
+        payload_size=128,
+        network_conditions=NetworkConditions(loss_percent=100),
+    )
+
+    assert result.delivered_count == 0
+    assert result.attempt_count == 1
+    assert result.transmission_count == 0
+    assert result.lost_attempt_count == 1
+    assert result.bytes_attempted == 128
+    assert result.bytes_transmitted == 0
+    assert result.attempts[0].outcome is AttemptOutcome.LOST
+    assert result.to_dict()["network_conditions"] == {
+        "duplicate_percent": 0,
+        "loss_percent": 100,
+        "reorder": False,
+    }
+
+
+def test_duplicate_transfer_is_counted_but_not_stored_twice() -> None:
+    result = run_three_node_chain(
+        EpidemicRouting(),
+        seed=42,
+        payload_size=128,
+        network_conditions=NetworkConditions(duplicate_percent=100),
+    )
+
+    assert result.delivered_count == 1
+    assert result.attempt_count == 4
+    assert result.transmission_count == 2
+    assert result.duplicate_attempt_count == 2
+    assert result.bytes_attempted == 4 * 128
+    assert result.bytes_transmitted == 2 * 128
+    assert result.peak_stored_messages == 3
+
+
+def test_duplicate_does_not_consume_extra_spray_tokens() -> None:
+    result = run_three_node_chain(
+        BinarySprayAndWait(copy_budget=2),
+        seed=42,
+        payload_size=128,
+        network_conditions=NetworkConditions(duplicate_percent=100),
+    )
+
+    assert result.delivered_count == 1
+    assert result.attempt_count == 4
+    assert result.transmission_count == 2
+    assert result.peak_stored_messages == 2
+    assert [item.sender_copies_left_after for item in result.transmissions] == [
+        1,
+        0,
+    ]
+
+
+def test_reordered_batch_delivers_all_messages_in_reverse_order() -> None:
+    low_id = "0" * 32
+    high_id = "f" * 32
+    simulation = Simulation(
+        node_ids=("alice", "bob"),
+        messages=(
+            make_message(message_id=low_id),
+            make_message(message_id=high_id),
+        ),
+        encounters=(Encounter(at=10, left="alice", right="bob"),),
+        seed=42,
+    )
+
+    result = simulation.run(
+        DirectDelivery(), NetworkConditions(reorder=True)
+    )
+
+    assert result.delivered_count == 2
+    assert [item.message_id for item in result.transmissions] == [high_id, low_id]
+    assert [item.outcome for item in result.attempts] == [
+        AttemptOutcome.STORED,
+        AttemptOutcome.STORED,
+    ]
+
+
+def test_retry_after_loss_preserves_spray_copy_budget() -> None:
+    simulation = Simulation(
+        node_ids=("alice", "relay", "bob"),
+        messages=(make_message(message_id="0" * 32),),
+        encounters=(
+            Encounter(at=10, left="alice", right="relay"),
+            Encounter(at=20, left="alice", right="bob"),
+        ),
+        seed=4,
+    )
+
+    result = simulation.run(
+        BinarySprayAndWait(copy_budget=2),
+        NetworkConditions(loss_percent=50),
+    )
+
+    assert result.delivered_count == 1
+    assert [item.outcome for item in result.attempts] == [
+        AttemptOutcome.LOST,
+        AttemptOutcome.STORED,
+    ]
+    assert result.transmissions[0].sender_copies_left_after == 1
+    assert result.transmissions[0].receiver_copies_left == 1
+
+
+def test_repeated_faulty_runs_are_identical() -> None:
+    conditions = NetworkConditions(
+        loss_percent=20, duplicate_percent=10, reorder=True
+    )
+
+    first = run_three_node_chain(
+        EpidemicRouting(), seed=20260716, network_conditions=conditions
+    )
+    second = run_three_node_chain(
+        EpidemicRouting(), seed=20260716, network_conditions=conditions
+    )
+
+    assert first == second
+    assert first.to_dict() == second.to_dict()

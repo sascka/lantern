@@ -91,7 +91,8 @@ Android, группы, карты, SOS, интернет-реле, Tor, BLE, Wi-
 Этапы, их состав и условия перехода записаны в [ROADMAP.md](ROADMAP.md).
 Этап 0 завершён. На Этапе 1 уже работает детерминированный сценарий
 Alice -> Relay -> Bob для Direct Delivery, Epidemic и Binary Spray-and-Wait.
-Инструкция находится в [simulator/README.md](simulator/README.md).
+Симулятор воспроизводит потери, дубликаты и перестановку контейнеров. Инструкция
+находится в [simulator/README.md](simulator/README.md).
 
 ## Участие в разработке
 
