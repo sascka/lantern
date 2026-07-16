@@ -2,18 +2,32 @@
 
 """Deterministic routing simulator for Lantern."""
 
-from lantern_sim.model import Encounter, Message, MessageIdGenerator, NodeState
+from lantern_sim.model import (
+    Encounter,
+    Message,
+    MessageIdGenerator,
+    NodeState,
+    StoredMessage,
+)
 from lantern_sim.routing import DirectDelivery, EpidemicRouting, RoutingPolicy
-from lantern_sim.simulation import Simulation, SimulationResult
+from lantern_sim.simulation import (
+    BlockReason,
+    RemovalReason,
+    Simulation,
+    SimulationResult,
+)
 
 __all__ = [
     "DirectDelivery",
+    "BlockReason",
     "Encounter",
     "EpidemicRouting",
     "Message",
     "MessageIdGenerator",
     "NodeState",
+    "RemovalReason",
     "RoutingPolicy",
     "Simulation",
     "SimulationResult",
+    "StoredMessage",
 ]

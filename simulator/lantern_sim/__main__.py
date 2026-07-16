@@ -8,7 +8,12 @@ import argparse
 import json
 from collections.abc import Sequence
 
-from lantern_sim.model import SimulationLimitError, SimulationValidationError
+from lantern_sim.model import (
+    DEFAULT_MAX_HOPS,
+    DEFAULT_TTL_SECONDS,
+    SimulationLimitError,
+    SimulationValidationError,
+)
 from lantern_sim.routing import DirectDelivery, EpidemicRouting, RoutingPolicy
 from lantern_sim.scenarios import DEFAULT_SEED, run_three_node_chain
 
@@ -35,6 +40,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=256,
         help="opaque simulated payload size in bytes",
     )
+    parser.add_argument(
+        "--ttl-seconds",
+        type=int,
+        default=DEFAULT_TTL_SECONDS,
+        help="message lifetime requested by the source",
+    )
+    parser.add_argument(
+        "--max-hops",
+        type=int,
+        default=DEFAULT_MAX_HOPS,
+        help="maximum number of sequential transmissions",
+    )
     return parser
 
 
@@ -51,6 +68,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             policies[args.policy],
             seed=args.seed,
             payload_size=args.payload_size,
+            ttl_seconds=args.ttl_seconds,
+            max_hops=args.max_hops,
         )
     except (SimulationValidationError, SimulationLimitError) as error:
         parser.error(str(error))

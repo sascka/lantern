@@ -4,7 +4,13 @@
 
 from __future__ import annotations
 
-from lantern_sim.model import Encounter, Message, MessageIdGenerator
+from lantern_sim.model import (
+    DEFAULT_MAX_HOPS,
+    DEFAULT_TTL_SECONDS,
+    Encounter,
+    Message,
+    MessageIdGenerator,
+)
 from lantern_sim.routing import RoutingPolicy
 from lantern_sim.simulation import Simulation, SimulationResult
 
@@ -16,6 +22,8 @@ def run_three_node_chain(
     *,
     seed: int = DEFAULT_SEED,
     payload_size: int = 256,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    max_hops: int = DEFAULT_MAX_HOPS,
 ) -> SimulationResult:
     """Run Alice -> Relay -> Bob with no direct Alice/Bob encounter."""
 
@@ -26,6 +34,8 @@ def run_three_node_chain(
         destination="bob",
         created_at=0,
         payload_size=payload_size,
+        ttl_seconds=ttl_seconds,
+        max_hops=max_hops,
     )
     simulation = Simulation(
         node_ids=("alice", "relay", "bob"),

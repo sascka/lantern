@@ -6,18 +6,18 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from lantern_sim.model import Message, NodeState
+from lantern_sim.model import NodeState, StoredMessage
 
 
 class RoutingPolicy(Protocol):
-    """Select messages for one direction of an encounter."""
+    """Select local copies for one direction of an encounter."""
 
     name: str
 
     def messages_to_forward(
         self, sender: NodeState, receiver: NodeState
-    ) -> tuple[Message, ...]:
-        """Return a deterministic, bounded tuple of messages to forward."""
+    ) -> tuple[StoredMessage, ...]:
+        """Return a deterministic, bounded tuple of copies to forward."""
 
 
 class DirectDelivery:
@@ -27,12 +27,12 @@ class DirectDelivery:
 
     def messages_to_forward(
         self, sender: NodeState, receiver: NodeState
-    ) -> tuple[Message, ...]:
+    ) -> tuple[StoredMessage, ...]:
         return tuple(
-            message
-            for message in sender.messages()
-            if message.destination == receiver.node_id
-            and not receiver.has_message(message.message_id)
+            stored_message
+            for stored_message in sender.messages()
+            if stored_message.message.destination == receiver.node_id
+            and not receiver.has_message(stored_message.message.message_id)
         )
 
 
@@ -43,9 +43,9 @@ class EpidemicRouting:
 
     def messages_to_forward(
         self, sender: NodeState, receiver: NodeState
-    ) -> tuple[Message, ...]:
+    ) -> tuple[StoredMessage, ...]:
         return tuple(
-            message
-            for message in sender.messages()
-            if not receiver.has_message(message.message_id)
+            stored_message
+            for stored_message in sender.messages()
+            if not receiver.has_message(stored_message.message.message_id)
         )

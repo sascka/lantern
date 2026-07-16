@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Final
 
 from lantern_sim.model import (
@@ -12,6 +13,7 @@ from lantern_sim.model import (
     Message,
     NodeState,
     SimulationValidationError,
+    StoredMessage,
     validate_node_id,
 )
 from lantern_sim.routing import RoutingPolicy
@@ -22,6 +24,15 @@ MAX_SIMULATION_ENCOUNTERS: Final = 1_000_000
 MAX_SEED: Final = (1 << 64) - 1
 
 
+class RemovalReason(str, Enum):
+    TTL_EXPIRED = "ttl_expired"
+
+
+class BlockReason(str, Enum):
+    HOP_LIMIT_EXCEEDED = "hop_limit_exceeded"
+    HOP_LIMIT_BEFORE_DESTINATION = "hop_limit_before_destination"
+
+
 @dataclass(frozen=True, slots=True)
 class Transmission:
     at: int
@@ -29,6 +40,8 @@ class Transmission:
     receiver: str
     message_id: str
     payload_size: int
+    remaining_ttl: int
+    hops_taken: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +52,23 @@ class Delivery:
 
 
 @dataclass(frozen=True, slots=True)
+class Removal:
+    at: int
+    node_id: str
+    message_id: str
+    reason: RemovalReason
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedTransfer:
+    at: int
+    sender: str
+    receiver: str
+    message_id: str
+    reason: BlockReason
+
+
+@dataclass(frozen=True, slots=True)
 class SimulationResult:
     seed: int
     policy: str
@@ -46,6 +76,8 @@ class SimulationResult:
     message_count: int
     transmissions: tuple[Transmission, ...]
     deliveries: tuple[Delivery, ...]
+    removals: tuple[Removal, ...]
+    blocked_transfers: tuple[BlockedTransfer, ...]
     peak_stored_messages: int
     peak_stored_bytes: int
 
@@ -76,6 +108,17 @@ class SimulationResult:
     def to_dict(self) -> dict[str, object]:
         return {
             "average_delivery_delay": self.average_delivery_delay,
+            "blocked_transfer_count": len(self.blocked_transfers),
+            "blocked_transfers": [
+                {
+                    "at": blocked.at,
+                    "message_id": blocked.message_id,
+                    "reason": blocked.reason.value,
+                    "receiver": blocked.receiver,
+                    "sender": blocked.sender,
+                }
+                for blocked in self.blocked_transfers
+            ],
             "bytes_transmitted": self.bytes_transmitted,
             "delivered_count": self.delivered_count,
             "deliveries": [
@@ -92,14 +135,26 @@ class SimulationResult:
             "peak_stored_bytes": self.peak_stored_bytes,
             "peak_stored_messages": self.peak_stored_messages,
             "policy": self.policy,
+            "removal_count": len(self.removals),
+            "removals": [
+                {
+                    "at": removal.at,
+                    "message_id": removal.message_id,
+                    "node_id": removal.node_id,
+                    "reason": removal.reason.value,
+                }
+                for removal in self.removals
+            ],
             "seed": self.seed,
             "transmission_count": self.transmission_count,
             "transmissions": [
                 {
                     "at": transmission.at,
+                    "hops_taken": transmission.hops_taken,
                     "message_id": transmission.message_id,
                     "payload_size": transmission.payload_size,
                     "receiver": transmission.receiver,
+                    "remaining_ttl": transmission.remaining_ttl,
                     "sender": transmission.sender,
                 }
                 for transmission in self.transmissions
@@ -182,6 +237,8 @@ class Simulation:
     def run(self, policy: RoutingPolicy) -> SimulationResult:
         states = {node_id: NodeState(node_id) for node_id in self._node_ids}
         transmissions: list[Transmission] = []
+        removals: list[Removal] = []
+        blocked_transfers: list[BlockedTransfer] = []
         delivered_at: dict[str, int] = {}
         peak_stored_messages = 0
         peak_stored_bytes = 0
@@ -205,10 +262,12 @@ class Simulation:
         events.sort(key=lambda event: (event[0], event[1], event[2]))
 
         for at, event_kind, _, event in events:
+            self._remove_expired(at=at, states=states, removals=removals)
+
             if event_kind == 0:
                 if not isinstance(event, Message):
                     raise AssertionError("message event has an invalid type")
-                states[event.source].store(event)
+                states[event.source].store_origin(event)
                 update_peaks()
                 continue
 
@@ -227,6 +286,7 @@ class Simulation:
                 messages=left_to_right,
                 transmissions=transmissions,
                 delivered_at=delivered_at,
+                blocked_transfers=blocked_transfers,
             )
             self._transfer(
                 at=at,
@@ -235,6 +295,7 @@ class Simulation:
                 messages=right_to_left,
                 transmissions=transmissions,
                 delivered_at=delivered_at,
+                blocked_transfers=blocked_transfers,
             )
             update_peaks()
 
@@ -255,9 +316,29 @@ class Simulation:
             message_count=len(self._messages),
             transmissions=tuple(transmissions),
             deliveries=deliveries,
+            removals=tuple(removals),
+            blocked_transfers=tuple(blocked_transfers),
             peak_stored_messages=peak_stored_messages,
             peak_stored_bytes=peak_stored_bytes,
         )
+
+    @staticmethod
+    def _remove_expired(
+        *,
+        at: int,
+        states: dict[str, NodeState],
+        removals: list[Removal],
+    ) -> None:
+        for node_id, state in states.items():
+            for stored_message in state.remove_expired(at):
+                removals.append(
+                    Removal(
+                        at=at,
+                        node_id=node_id,
+                        message_id=stored_message.message.message_id,
+                        reason=RemovalReason.TTL_EXPIRED,
+                    )
+                )
 
     @staticmethod
     def _transfer(
@@ -265,16 +346,48 @@ class Simulation:
         at: int,
         sender: NodeState,
         receiver: NodeState,
-        messages: tuple[Message, ...],
+        messages: tuple[StoredMessage, ...],
         transmissions: list[Transmission],
         delivered_at: dict[str, int],
+        blocked_transfers: list[BlockedTransfer],
     ) -> None:
-        for message in messages:
-            if not sender.has_message(message.message_id):
+        for stored_message in messages:
+            message = stored_message.message
+            current = sender.get_message(message.message_id)
+            if current != stored_message:
                 raise SimulationValidationError(
-                    "routing policy selected a message missing from the sender"
+                    "routing policy selected a stale or missing local copy"
                 )
-            if not receiver.store(message):
+
+            next_hops = stored_message.hops_taken + 1
+            if next_hops > message.max_hops:
+                blocked_transfers.append(
+                    BlockedTransfer(
+                        at=at,
+                        sender=sender.node_id,
+                        receiver=receiver.node_id,
+                        message_id=message.message_id,
+                        reason=BlockReason.HOP_LIMIT_EXCEEDED,
+                    )
+                )
+                continue
+            if (
+                next_hops == message.max_hops
+                and receiver.node_id != message.destination
+            ):
+                blocked_transfers.append(
+                    BlockedTransfer(
+                        at=at,
+                        sender=sender.node_id,
+                        receiver=receiver.node_id,
+                        message_id=message.message_id,
+                        reason=BlockReason.HOP_LIMIT_BEFORE_DESTINATION,
+                    )
+                )
+                continue
+
+            forwarded_copy = stored_message.forwarded_copy(at)
+            if not receiver.store_forwarded(forwarded_copy):
                 continue
 
             transmissions.append(
@@ -284,6 +397,8 @@ class Simulation:
                     receiver=receiver.node_id,
                     message_id=message.message_id,
                     payload_size=message.payload_size,
+                    remaining_ttl=forwarded_copy.remaining_ttl,
+                    hops_taken=forwarded_copy.hops_taken,
                 )
             )
             if receiver.node_id == message.destination:

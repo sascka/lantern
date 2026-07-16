@@ -14,6 +14,12 @@ MAX_STORED_MESSAGES_PER_NODE = 1_000
 MAX_STORED_BYTES_PER_NODE = 64 * 1024 * 1024
 MAX_GENERATED_MESSAGES = 100_000
 MAX_SEED = (1 << 64) - 1
+MIN_TTL_SECONDS = 60
+MAX_TTL_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_TTL_SECONDS = 300
+MIN_HOPS = 1
+MAX_HOPS = 16
+DEFAULT_MAX_HOPS = 16
 
 _NODE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 _MESSAGE_ID_PATTERN = re.compile(r"[0-9a-f]{32}", re.ASCII)
@@ -49,15 +55,28 @@ def _validate_non_negative_time(value: int, field_name: str) -> None:
         raise SimulationValidationError(f"{field_name} must not be negative")
 
 
+def _validate_bounded_integer(
+    value: int, *, field_name: str, minimum: int, maximum: int
+) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SimulationValidationError(f"{field_name} must be an integer")
+    if not minimum <= value <= maximum:
+        raise SimulationValidationError(
+            f"{field_name} must be between {minimum} and {maximum}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Message:
-    """Opaque simulated message metadata without plaintext or cryptography."""
+    """Immutable simulated Envelope metadata without plaintext or cryptography."""
 
     message_id: str
     source: str
     destination: str
     created_at: int
     payload_size: int
+    ttl_seconds: int = DEFAULT_TTL_SECONDS
+    max_hops: int = DEFAULT_MAX_HOPS
 
     def __post_init__(self) -> None:
         if not isinstance(self.message_id, str):
@@ -75,14 +94,84 @@ class Message:
             )
 
         _validate_non_negative_time(self.created_at, "created_at")
-        if isinstance(self.payload_size, bool) or not isinstance(
-            self.payload_size, int
-        ):
-            raise SimulationValidationError("payload_size must be an integer")
-        if not 1 <= self.payload_size <= MAX_ENVELOPE_SIZE:
+        _validate_bounded_integer(
+            self.payload_size,
+            field_name="payload_size",
+            minimum=1,
+            maximum=MAX_ENVELOPE_SIZE,
+        )
+        _validate_bounded_integer(
+            self.ttl_seconds,
+            field_name="ttl_seconds",
+            minimum=MIN_TTL_SECONDS,
+            maximum=MAX_TTL_SECONDS,
+        )
+        _validate_bounded_integer(
+            self.max_hops,
+            field_name="max_hops",
+            minimum=MIN_HOPS,
+            maximum=MAX_HOPS,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StoredMessage:
+    """One local copy with mutable-route values represented immutably."""
+
+    message: Message
+    received_at: int
+    remaining_ttl: int
+    hops_taken: int
+
+    def __post_init__(self) -> None:
+        _validate_non_negative_time(self.received_at, "received_at")
+        if self.received_at < self.message.created_at:
             raise SimulationValidationError(
-                f"payload_size must be between 1 and {MAX_ENVELOPE_SIZE} bytes"
+                "received_at must not be earlier than message creation"
             )
+        _validate_bounded_integer(
+            self.remaining_ttl,
+            field_name="remaining_ttl",
+            minimum=1,
+            maximum=self.message.ttl_seconds,
+        )
+        _validate_bounded_integer(
+            self.hops_taken,
+            field_name="hops_taken",
+            minimum=0,
+            maximum=self.message.max_hops,
+        )
+
+    @classmethod
+    def from_origin(cls, message: Message) -> StoredMessage:
+        return cls(
+            message=message,
+            received_at=message.created_at,
+            remaining_ttl=message.ttl_seconds,
+            hops_taken=0,
+        )
+
+    def remaining_ttl_at(self, at: int) -> int:
+        _validate_non_negative_time(at, "current time")
+        if at < self.received_at:
+            raise SimulationValidationError(
+                "current time must not be earlier than received_at"
+            )
+        return max(0, self.remaining_ttl - (at - self.received_at))
+
+    def forwarded_copy(self, at: int) -> StoredMessage:
+        remaining_ttl = self.remaining_ttl_at(at)
+        if remaining_ttl == 0:
+            raise SimulationValidationError("cannot forward an expired message")
+        if self.hops_taken >= self.message.max_hops:
+            raise SimulationValidationError("cannot exceed max_hops")
+
+        return StoredMessage(
+            message=self.message,
+            received_at=at,
+            remaining_ttl=remaining_ttl,
+            hops_taken=self.hops_taken + 1,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,13 +196,9 @@ class MessageIdGenerator:
     """Create deterministic simulation-only identifiers from a fixed seed."""
 
     def __init__(self, seed: int) -> None:
-        if isinstance(seed, bool) or not isinstance(seed, int):
-            raise SimulationValidationError("seed must be an integer")
-        if not 0 <= seed <= MAX_SEED:
-            raise SimulationValidationError(
-                f"seed must be between 0 and {MAX_SEED}"
-            )
-
+        _validate_bounded_integer(
+            seed, field_name="seed", minimum=0, maximum=MAX_SEED
+        )
         self._random = random.Random(seed)
         self._issued: set[str] = set()
 
@@ -134,10 +219,10 @@ class MessageIdGenerator:
 
 @dataclass(slots=True)
 class NodeState:
-    """Mutable local store of a simulated node with hard safety limits."""
+    """Mutable local store of simulated copies with hard safety limits."""
 
     node_id: str
-    _messages: dict[str, Message] = field(default_factory=dict, init=False)
+    _messages: dict[str, StoredMessage] = field(default_factory=dict, init=False)
     _stored_bytes: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
@@ -154,15 +239,23 @@ class NodeState:
     def has_message(self, message_id: str) -> bool:
         return message_id in self._messages
 
-    def messages(self) -> tuple[Message, ...]:
+    def get_message(self, message_id: str) -> StoredMessage | None:
+        return self._messages.get(message_id)
+
+    def messages(self) -> tuple[StoredMessage, ...]:
         return tuple(self._messages[key] for key in sorted(self._messages))
 
-    def store(self, message: Message) -> bool:
-        """Store a new message and return False for an identical duplicate."""
+    def store_origin(self, message: Message) -> bool:
+        return self._store(StoredMessage.from_origin(message))
 
+    def store_forwarded(self, stored_message: StoredMessage) -> bool:
+        return self._store(stored_message)
+
+    def _store(self, stored_message: StoredMessage) -> bool:
+        message = stored_message.message
         existing = self._messages.get(message.message_id)
         if existing is not None:
-            if existing != message:
+            if existing.message != message:
                 raise SimulationValidationError(
                     "the same message_id refers to different message metadata"
                 )
@@ -177,6 +270,25 @@ class NodeState:
                 f"node {self.node_id!r} reached the storage byte limit"
             )
 
-        self._messages[message.message_id] = message
+        self._messages[message.message_id] = stored_message
         self._stored_bytes += message.payload_size
         return True
+
+    def remove(self, message_id: str) -> StoredMessage | None:
+        stored_message = self._messages.pop(message_id, None)
+        if stored_message is not None:
+            self._stored_bytes -= stored_message.message.payload_size
+        return stored_message
+
+    def remove_expired(self, at: int) -> tuple[StoredMessage, ...]:
+        expired_ids = tuple(
+            message_id
+            for message_id, stored_message in sorted(self._messages.items())
+            if stored_message.remaining_ttl_at(at) == 0
+        )
+        removed: list[StoredMessage] = []
+        for message_id in expired_ids:
+            stored_message = self.remove(message_id)
+            if stored_message is not None:
+                removed.append(stored_message)
+        return tuple(removed)
