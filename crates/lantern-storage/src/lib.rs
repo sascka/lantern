@@ -810,3 +810,479 @@ fn database_error(_error: rusqlite::Error) -> StorageError {
     StorageError::Database
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs::{self, OpenOptions},
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use lantern_core::{
+        EnqueueOutcome, Envelope, LocalRouteRecord, MessageId, NORMAL_PRIORITY, PROTOCOL_VERSION,
+    };
+    use rusqlite::Connection;
+
+    use super::{
+        ClockRecovery, MAX_DATABASE_FILE_BYTES, SqliteQueueStore, StorageError, path_with_suffix,
+        read_pragma_i64,
+    };
+
+    static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TemporaryDatabase {
+        path: PathBuf,
+    }
+
+    impl TemporaryDatabase {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed);
+            let filename = format!(
+                "lantern-storage-test-{}-{sequence}-{label}.sqlite3",
+                std::process::id()
+            );
+            let path = std::env::temp_dir().join(filename);
+            remove_database_files(&path);
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TemporaryDatabase {
+        fn drop(&mut self) {
+            remove_database_files(&self.path);
+        }
+    }
+
+    fn remove_database_files(path: &Path) {
+        let _ = fs::remove_file(path);
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let _ = fs::remove_file(path_with_suffix(path, suffix));
+        }
+    }
+
+    fn limits() -> lantern_core::QueueLimits {
+        let result = lantern_core::QueueLimits::try_new(8, 256 * 1024, 16, 600);
+        let Ok(limits) = result else {
+            panic!("valid test queue limits were rejected");
+        };
+        limits
+    }
+
+    fn message_id(number: u64) -> MessageId {
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&number.to_be_bytes());
+        MessageId::from_bytes(bytes)
+    }
+
+    fn envelope(number: u64, ttl_seconds: u64, payload_size: usize) -> Envelope {
+        let result = Envelope::try_from_fields(
+            PROTOCOL_VERSION,
+            *message_id(number).as_bytes(),
+            [0x42; 16],
+            ttl_seconds,
+            4,
+            NORMAL_PRIORITY,
+            vec![number.to_le_bytes()[0]; payload_size],
+        );
+        let Ok(envelope) = result else {
+            panic!("valid test Envelope was rejected");
+        };
+        envelope
+    }
+
+    fn enqueue(
+        queue: &mut lantern_core::EnvelopeQueue,
+        number: u64,
+        first_seen_at: u64,
+        ttl_seconds: u64,
+        payload_size: usize,
+    ) {
+        let envelope = envelope(number, ttl_seconds, payload_size);
+        let route = LocalRouteRecord::for_origin(&envelope, first_seen_at);
+        let Ok(route) = route else {
+            panic!("valid test route was rejected");
+        };
+        let result = queue.enqueue(envelope, route, first_seen_at);
+        let Ok(result) = result else {
+            panic!("valid test entry could not be enqueued");
+        };
+        assert_eq!(result.outcome(), EnqueueOutcome::Stored);
+    }
+
+    #[test]
+    fn queue_and_tombstone_round_trip_across_reopen() {
+        let database = TemporaryDatabase::new("round-trip");
+        let limits = limits();
+        let mut queue = lantern_core::EnvelopeQueue::new(limits);
+        enqueue(&mut queue, 1, 100, 300, 32);
+        enqueue(&mut queue, 2, 101, 300, 48);
+        assert!(queue.remove_opened(message_id(2), 110).is_ok());
+        let expected_bytes = queue.stored_bytes();
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("new database could not be opened");
+        };
+        assert_eq!(store.save(&queue, 111), Ok(()));
+        drop(store);
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("saved database could not be reopened");
+        };
+        let recovered = store.load(112);
+        let Ok(recovered) = recovered else {
+            panic!("saved queue could not be recovered");
+        };
+        assert_eq!(recovered.report().clock_recovery(), ClockRecovery::Normal);
+        assert_eq!(recovered.report().expired_entries(), 0);
+        assert_eq!(recovered.queue().len(), 1);
+        assert_eq!(recovered.queue().tombstone_count(), 1);
+        assert_eq!(recovered.queue().stored_bytes(), expected_bytes);
+        assert!(recovered.queue().get(message_id(1)).is_some());
+    }
+
+    #[test]
+    fn normal_restart_expires_due_entry_and_persists_tombstone() {
+        let database = TemporaryDatabase::new("expiry");
+        let limits = limits();
+        let mut queue = lantern_core::EnvelopeQueue::new(limits);
+        enqueue(&mut queue, 1, 100, 60, 8);
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("new database could not be opened");
+        };
+        assert_eq!(store.save(&queue, 100), Ok(()));
+        drop(store);
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("saved database could not be reopened");
+        };
+        let recovered = store.load(160);
+        let Ok(recovered) = recovered else {
+            panic!("due queue could not be recovered");
+        };
+        assert_eq!(recovered.report().expired_entries(), 1);
+        assert!(recovered.queue().is_empty());
+        assert_eq!(recovered.queue().tombstone_count(), 1);
+        drop(store);
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("recovered database could not be reopened");
+        };
+        let recovered = store.load(161);
+        let Ok(recovered) = recovered else {
+            panic!("recovery result was not persisted");
+        };
+        assert!(recovered.queue().is_empty());
+        assert_eq!(recovered.queue().tombstone_count(), 1);
+    }
+
+    #[test]
+    fn clock_rollback_expires_all_active_entries() {
+        let database = TemporaryDatabase::new("clock-rollback");
+        let limits = limits();
+        let mut queue = lantern_core::EnvelopeQueue::new(limits);
+        enqueue(&mut queue, 1, 900, 300, 8);
+        enqueue(&mut queue, 2, 901, 300, 8);
+        assert!(queue.remove_opened(message_id(2), 910).is_ok());
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("new database could not be opened");
+        };
+        assert_eq!(store.save(&queue, 1_000), Ok(()));
+        drop(store);
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("saved database could not be reopened");
+        };
+        let recovered = store.load(900);
+        let Ok(recovered) = recovered else {
+            panic!("rollback recovery failed");
+        };
+        assert_eq!(
+            recovered.report().clock_recovery(),
+            ClockRecovery::RollbackDetected
+        );
+        assert_eq!(recovered.report().expired_entries(), 1);
+        assert!(recovered.queue().is_empty());
+        assert_eq!(recovered.queue().tombstone_count(), 2);
+        let new_tombstone = recovered
+            .queue()
+            .tombstones()
+            .find(|entry| entry.message_id() == message_id(1));
+        let Some(new_tombstone) = new_tombstone else {
+            panic!("expired active entry did not create a tombstone");
+        };
+        assert_eq!(new_tombstone.recorded_at(), 900);
+        assert_eq!(new_tombstone.expires_at(), 1_500);
+        let rebased_tombstone = recovered
+            .queue()
+            .tombstones()
+            .find(|entry| entry.message_id() == message_id(2));
+        let Some(rebased_tombstone) = rebased_tombstone else {
+            panic!("existing tombstone disappeared during clock recovery");
+        };
+        assert_eq!(rebased_tombstone.expires_at(), 1_410);
+        assert_eq!(store.last_observed_wall_seconds(), 900);
+    }
+
+    #[test]
+    fn clock_rollback_discards_tombstone_expired_at_last_known_time() {
+        let database = TemporaryDatabase::new("clock-rollback-expired-tombstone");
+        let limits = limits();
+        let mut queue = lantern_core::EnvelopeQueue::new(limits);
+        enqueue(&mut queue, 1, 10, 300, 8);
+        assert!(queue.remove_opened(message_id(1), 100).is_ok());
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("new database could not be opened");
+        };
+        assert_eq!(store.save(&queue, 800), Ok(()));
+        drop(store);
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("saved database could not be reopened");
+        };
+        let recovered = store.load(700);
+        let Ok(recovered) = recovered else {
+            panic!("rollback recovery failed");
+        };
+        assert_eq!(
+            recovered.report().clock_recovery(),
+            ClockRecovery::RollbackDetected
+        );
+        assert_eq!(recovered.report().expired_tombstones(), 1);
+        assert_eq!(recovered.queue().tombstone_count(), 0);
+    }
+
+    #[test]
+    fn save_rejects_backward_clock_without_replacing_snapshot() {
+        let database = TemporaryDatabase::new("save-rollback");
+        let limits = limits();
+        let mut queue = lantern_core::EnvelopeQueue::new(limits);
+        enqueue(&mut queue, 1, 10, 300, 8);
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("new database could not be opened");
+        };
+        assert_eq!(store.save(&queue, 100), Ok(()));
+
+        enqueue(&mut queue, 2, 20, 300, 8);
+        assert_eq!(store.save(&queue, 99), Err(StorageError::ClockRollback));
+        drop(store);
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("saved database could not be reopened");
+        };
+        let recovered = store.load(100);
+        let Ok(recovered) = recovered else {
+            panic!("previous snapshot could not be recovered");
+        };
+        assert_eq!(recovered.queue().len(), 1);
+        assert!(recovered.queue().get(message_id(1)).is_some());
+        assert!(recovered.queue().get(message_id(2)).is_none());
+    }
+
+    #[test]
+    fn corrupt_cbor_and_route_fields_are_rejected() {
+        for (label, sql, expected) in [
+            (
+                "corrupt-cbor",
+                "UPDATE queue_entries SET envelope_cbor = x'00'",
+                StorageError::Cbor(lantern_core::CborError::ExpectedMap),
+            ),
+            (
+                "corrupt-route",
+                "UPDATE queue_entries SET local_deadline_wall_seconds = local_deadline_wall_seconds + 1",
+                StorageError::CorruptData,
+            ),
+        ] {
+            let database = TemporaryDatabase::new(label);
+            let limits = limits();
+            let mut queue = lantern_core::EnvelopeQueue::new(limits);
+            enqueue(&mut queue, 1, 100, 300, 8);
+            let store = SqliteQueueStore::open(database.path(), limits);
+            let Ok(mut store) = store else {
+                panic!("new database could not be opened");
+            };
+            assert_eq!(store.save(&queue, 100), Ok(()));
+            drop(store);
+
+            let connection = Connection::open(database.path());
+            let Ok(connection) = connection else {
+                panic!("test database could not be modified");
+            };
+            assert_eq!(connection.execute(sql, []), Ok(1));
+            drop(connection);
+
+            let store = SqliteQueueStore::open(database.path(), limits);
+            let Ok(mut store) = store else {
+                panic!("structurally valid database could not be reopened");
+            };
+            assert_eq!(store.load(101).err(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn wrong_application_schema_and_limits_are_rejected() {
+        let wrong_application = TemporaryDatabase::new("wrong-application");
+        let connection = Connection::open(wrong_application.path());
+        let Ok(connection) = connection else {
+            panic!("test database could not be created");
+        };
+        assert!(
+            connection
+                .pragma_update(None, "application_id", 123_i64)
+                .is_ok()
+        );
+        drop(connection);
+        assert!(matches!(
+            SqliteQueueStore::open(wrong_application.path(), limits()),
+            Err(StorageError::WrongApplication)
+        ));
+
+        let database = TemporaryDatabase::new("schema-and-limits");
+        let store = SqliteQueueStore::open(database.path(), limits());
+        let Ok(store) = store else {
+            panic!("new database could not be opened");
+        };
+        drop(store);
+        let other_limits = lantern_core::QueueLimits::try_new(7, 256 * 1024, 16, 600);
+        let Ok(other_limits) = other_limits else {
+            panic!("valid alternate limits were rejected");
+        };
+        assert!(matches!(
+            SqliteQueueStore::open(database.path(), other_limits),
+            Err(StorageError::LimitMismatch)
+        ));
+
+        let connection = Connection::open(database.path());
+        let Ok(connection) = connection else {
+            panic!("test database could not be modified");
+        };
+        assert!(
+            connection
+                .pragma_update(None, "user_version", 2_i64)
+                .is_ok()
+        );
+        drop(connection);
+        assert!(matches!(
+            SqliteQueueStore::open(database.path(), limits()),
+            Err(StorageError::UnsupportedSchema)
+        ));
+    }
+
+    #[test]
+    fn failed_sqlite_transaction_preserves_previous_snapshot() {
+        let database = TemporaryDatabase::new("atomic-failure");
+        let limits = limits();
+        let mut original = lantern_core::EnvelopeQueue::new(limits);
+        enqueue(&mut original, 1, 100, 300, 8);
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("new database could not be opened");
+        };
+        assert_eq!(store.save(&original, 100), Ok(()));
+        let page_count = read_pragma_i64(&store.connection, "page_count");
+        let Ok(page_count) = page_count else {
+            panic!("database page count could not be read");
+        };
+        assert!(
+            store
+                .connection
+                .pragma_update(None, "max_page_count", page_count)
+                .is_ok()
+        );
+
+        let mut replacement = lantern_core::EnvelopeQueue::new(limits);
+        enqueue(&mut replacement, 2, 101, 300, 63 * 1024);
+        assert_eq!(store.save(&replacement, 101), Err(StorageError::Database));
+        drop(store);
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("database could not be reopened after failed transaction");
+        };
+        let recovered = store.load(100);
+        let Ok(recovered) = recovered else {
+            panic!("previous snapshot was not preserved");
+        };
+        assert_eq!(recovered.queue().len(), 1);
+        assert!(recovered.queue().get(message_id(1)).is_some());
+        assert!(recovered.queue().get(message_id(2)).is_none());
+    }
+
+    #[test]
+    fn oversized_file_is_rejected_before_sqlite_opens_it() {
+        let database = TemporaryDatabase::new("oversized");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(database.path());
+        let Ok(file) = file else {
+            panic!("oversized test file could not be created");
+        };
+        assert!(file.set_len(MAX_DATABASE_FILE_BYTES + 1).is_ok());
+        drop(file);
+
+        assert!(matches!(
+            SqliteQueueStore::open(database.path(), limits()),
+            Err(StorageError::FileTooLarge)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_permissions_are_restricted_and_symlinks_are_rejected() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let database = TemporaryDatabase::new("permissions");
+        let store = SqliteQueueStore::open(database.path(), limits());
+        let Ok(store) = store else {
+            panic!("new database could not be opened");
+        };
+        drop(store);
+        let metadata = fs::metadata(database.path());
+        let Ok(metadata) = metadata else {
+            panic!("database metadata could not be read");
+        };
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        let link = TemporaryDatabase::new("symlink");
+        assert!(symlink(database.path(), link.path()).is_ok());
+        assert!(matches!(
+            SqliteQueueStore::open(link.path(), limits()),
+            Err(StorageError::Io)
+        ));
+    }
+
+    #[test]
+    fn debug_and_errors_do_not_disclose_path_or_exact_clock() {
+        let database = TemporaryDatabase::new("PRIVATE-PATH-MARKER");
+        let store = SqliteQueueStore::open(database.path(), limits());
+        let Ok(mut store) = store else {
+            panic!("new database could not be opened");
+        };
+        let queue = lantern_core::EnvelopeQueue::new(limits());
+        assert_eq!(store.save(&queue, 987_654_321), Ok(()));
+
+        let output = format!("{store:?} {}", StorageError::Database);
+        assert!(!output.contains("PRIVATE-PATH-MARKER"));
+        assert!(!output.contains("987654321"));
+        assert!(!output.contains("987_654_321"));
+        assert!(!output.contains("SELECT"));
+    }
+}
