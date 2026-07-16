@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import random
+
 from lantern_sim.faults import NetworkConditions
 from lantern_sim.model import (
     DEFAULT_MAX_HOPS,
@@ -11,6 +14,7 @@ from lantern_sim.model import (
     Encounter,
     Message,
     MessageIdGenerator,
+    SimulationValidationError,
     StorageQuota,
 )
 from lantern_sim.routing import RoutingPolicy
@@ -18,6 +22,169 @@ from lantern_sim.simulation import Simulation, SimulationResult
 from lantern_sim.tombstones import TombstoneConfig
 
 DEFAULT_SEED = 20_260_716
+MIN_MESH_NODES = 4
+MAX_MESH_NODES = 50
+MAX_MESH_MESSAGES = 100
+MAX_MESH_ENCOUNTERS = 10_000
+
+
+def _validate_count(
+    value: int, *, field_name: str, minimum: int, maximum: int
+) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SimulationValidationError(f"{field_name} must be an integer")
+    if not minimum <= value <= maximum:
+        raise SimulationValidationError(
+            f"{field_name} must be between {minimum} and {maximum}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MeshScenarioConfig:
+    node_count: int = 20
+    message_count: int = 10
+    encounter_count: int = 200
+    payload_size: int = 256
+    ttl_seconds: int = DEFAULT_TTL_SECONDS
+    max_hops: int = DEFAULT_MAX_HOPS
+
+    def __post_init__(self) -> None:
+        _validate_count(
+            self.node_count,
+            field_name="node_count",
+            minimum=MIN_MESH_NODES,
+            maximum=MAX_MESH_NODES,
+        )
+        _validate_count(
+            self.message_count,
+            field_name="message_count",
+            minimum=1,
+            maximum=MAX_MESH_MESSAGES,
+        )
+        _validate_count(
+            self.encounter_count,
+            field_name="encounter_count",
+            minimum=self.node_count,
+            maximum=MAX_MESH_ENCOUNTERS,
+        )
+
+        Message(
+            message_id="0" * 32,
+            source="source",
+            destination="destination",
+            created_at=0,
+            payload_size=self.payload_size,
+            ttl_seconds=self.ttl_seconds,
+            max_hops=self.max_hops,
+        )
+
+    def parameters(self) -> tuple[tuple[str, int], ...]:
+        return (
+            ("encounter_count", self.encounter_count),
+            ("max_hops", self.max_hops),
+            ("message_count", self.message_count),
+            ("node_count", self.node_count),
+            ("payload_size", self.payload_size),
+            ("ttl_seconds", self.ttl_seconds),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedScenario:
+    node_ids: tuple[str, ...]
+    messages: tuple[Message, ...]
+    encounters: tuple[Encounter, ...]
+    seed: int
+    name: str
+    parameters: tuple[tuple[str, int], ...]
+
+    def simulation(self) -> Simulation:
+        return Simulation(
+            node_ids=self.node_ids,
+            messages=self.messages,
+            encounters=self.encounters,
+            seed=self.seed,
+            scenario=self.name,
+            scenario_parameters=self.parameters,
+        )
+
+
+def generate_uniform_contact_scenario(
+    config: MeshScenarioConfig, *, seed: int = DEFAULT_SEED
+) -> GeneratedScenario:
+    """Create a bounded synthetic contact trace without physical movement."""
+
+    id_generator = MessageIdGenerator(seed)
+    message_random = random.Random(f"lantern-messages-v1:{seed}")
+    encounter_random = random.Random(f"lantern-encounters-v1:{seed}")
+    node_ids = tuple(f"node{index:03d}" for index in range(config.node_count))
+
+    messages: list[Message] = []
+    latest_creation_time = config.encounter_count // 4
+    for _ in range(config.message_count):
+        source_index = message_random.randrange(config.node_count)
+        destination_index = message_random.randrange(config.node_count - 1)
+        if destination_index >= source_index:
+            destination_index += 1
+        messages.append(
+            Message(
+                message_id=id_generator.next_id(),
+                source=node_ids[source_index],
+                destination=node_ids[destination_index],
+                created_at=message_random.randrange(latest_creation_time + 1),
+                payload_size=config.payload_size,
+                ttl_seconds=config.ttl_seconds,
+                max_hops=config.max_hops,
+            )
+        )
+
+    encounters = [
+        Encounter(
+            at=index + 1,
+            left=node_ids[index],
+            right=node_ids[(index + 1) % config.node_count],
+        )
+        for index in range(config.node_count)
+    ]
+    for index in range(config.node_count, config.encounter_count):
+        left_index = encounter_random.randrange(config.node_count)
+        right_index = encounter_random.randrange(config.node_count - 1)
+        if right_index >= left_index:
+            right_index += 1
+        encounters.append(
+            Encounter(
+                at=index + 1,
+                left=node_ids[left_index],
+                right=node_ids[right_index],
+            )
+        )
+
+    return GeneratedScenario(
+        node_ids=node_ids,
+        messages=tuple(messages),
+        encounters=tuple(encounters),
+        seed=seed,
+        name="uniform_contacts",
+        parameters=config.parameters(),
+    )
+
+
+def run_uniform_contact_scenario(
+    policy: RoutingPolicy,
+    *,
+    config: MeshScenarioConfig,
+    seed: int = DEFAULT_SEED,
+    network_conditions: NetworkConditions | None = None,
+    storage_quota: StorageQuota | None = None,
+    tombstone_config: TombstoneConfig | None = None,
+) -> SimulationResult:
+    scenario = generate_uniform_contact_scenario(config, seed=seed)
+    return scenario.simulation().run(
+        policy,
+        network_conditions=network_conditions,
+        storage_quota=storage_quota,
+        tombstone_config=tombstone_config,
+    )
 
 
 def run_three_node_chain(
@@ -51,6 +218,12 @@ def run_three_node_chain(
             Encounter(at=20, left="relay", right="bob"),
         ),
         seed=seed,
+        scenario="three_node_chain",
+        scenario_parameters=(
+            ("max_hops", max_hops),
+            ("payload_size", payload_size),
+            ("ttl_seconds", ttl_seconds),
+        ),
     )
     return simulation.run(
         policy,

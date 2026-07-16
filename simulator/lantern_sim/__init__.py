@@ -20,6 +20,12 @@ from lantern_sim.routing import (
     ForwardingDecision,
     RoutingPolicy,
 )
+from lantern_sim.scenarios import (
+    GeneratedScenario,
+    MeshScenarioConfig,
+    generate_uniform_contact_scenario,
+    run_uniform_contact_scenario,
+)
 from lantern_sim.simulation import (
     AttemptOutcome,
     BlockReason,
@@ -46,8 +52,10 @@ __all__ = [
     "Encounter",
     "EpidemicRouting",
     "ForwardingDecision",
+    "GeneratedScenario",
     "Message",
     "MessageIdGenerator",
+    "MeshScenarioConfig",
     "NetworkConditions",
     "NodeState",
     "RemovalReason",
@@ -66,4 +74,6 @@ __all__ = [
     "TombstoneRejection",
     "TombstoneStore",
     "TransferAttempt",
+    "generate_uniform_contact_scenario",
+    "run_uniform_contact_scenario",
 ]

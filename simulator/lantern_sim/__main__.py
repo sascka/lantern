@@ -25,7 +25,12 @@ from lantern_sim.routing import (
     EpidemicRouting,
     RoutingPolicy,
 )
-from lantern_sim.scenarios import DEFAULT_SEED, run_three_node_chain
+from lantern_sim.scenarios import (
+    DEFAULT_SEED,
+    MeshScenarioConfig,
+    run_three_node_chain,
+    run_uniform_contact_scenario,
+)
 from lantern_sim.tombstones import (
     DEFAULT_MAX_TOMBSTONES,
     DEFAULT_TOMBSTONE_RETENTION_SECONDS,
@@ -35,7 +40,13 @@ from lantern_sim.tombstones import (
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the deterministic three-node Lantern scenario."
+        description="Run a deterministic Lantern routing scenario."
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=("chain", "mesh"),
+        default="chain",
+        help="three-node chain or bounded synthetic contact trace",
     )
     parser.add_argument(
         "--policy",
@@ -114,6 +125,29 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TOMBSTONE_RETENTION_SECONDS,
         help="how long a removed message ID remains blocked",
     )
+    parser.add_argument(
+        "--nodes",
+        type=int,
+        default=20,
+        help="node count for the mesh scenario",
+    )
+    parser.add_argument(
+        "--messages",
+        type=int,
+        default=10,
+        help="generated message count for the mesh scenario",
+    )
+    parser.add_argument(
+        "--encounters",
+        type=int,
+        default=200,
+        help="generated encounter count for the mesh scenario",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="omit detailed event arrays from JSON output",
+    )
     return parser
 
 
@@ -139,20 +173,51 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_entries=args.max_tombstones,
             retention_seconds=args.tombstone_retention_seconds,
         )
-        result = run_three_node_chain(
-            policies[args.policy],
-            seed=args.seed,
-            payload_size=args.payload_size,
-            ttl_seconds=args.ttl_seconds,
-            max_hops=args.max_hops,
-            network_conditions=network_conditions,
-            storage_quota=storage_quota,
-            tombstone_config=tombstone_config,
-        )
+        if args.scenario == "chain":
+            result = run_three_node_chain(
+                policies[args.policy],
+                seed=args.seed,
+                payload_size=args.payload_size,
+                ttl_seconds=args.ttl_seconds,
+                max_hops=args.max_hops,
+                network_conditions=network_conditions,
+                storage_quota=storage_quota,
+                tombstone_config=tombstone_config,
+            )
+        else:
+            scenario_config = MeshScenarioConfig(
+                node_count=args.nodes,
+                message_count=args.messages,
+                encounter_count=args.encounters,
+                payload_size=args.payload_size,
+                ttl_seconds=args.ttl_seconds,
+                max_hops=args.max_hops,
+            )
+            result = run_uniform_contact_scenario(
+                policies[args.policy],
+                config=scenario_config,
+                seed=args.seed,
+                network_conditions=network_conditions,
+                storage_quota=storage_quota,
+                tombstone_config=tombstone_config,
+            )
     except (SimulationValidationError, SimulationLimitError) as error:
         parser.error(str(error))
 
-    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    serialized = result.to_dict()
+    if args.summary:
+        for field_name in (
+            "attempts",
+            "blocked_transfers",
+            "deliveries",
+            "removals",
+            "storage_rejections",
+            "tombstone_events",
+            "tombstone_rejections",
+            "transmissions",
+        ):
+            serialized.pop(field_name)
+    print(json.dumps(serialized, indent=2, sort_keys=True))
     return 0
 
 

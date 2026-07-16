@@ -127,6 +127,8 @@ class TombstoneEvent:
 @dataclass(frozen=True, slots=True)
 class SimulationResult:
     seed: int
+    scenario: str
+    scenario_parameters: tuple[tuple[str, int], ...]
     policy: str
     policy_parameters: tuple[tuple[str, int], ...]
     network_conditions: NetworkConditions
@@ -267,6 +269,8 @@ class SimulationResult:
                 for removal in self.removals
             ],
             "quota_rejection_count": self.quota_rejection_count,
+            "scenario": self.scenario,
+            "scenario_parameters": dict(self.scenario_parameters),
             "seed": self.seed,
             "storage_quota": self.storage_quota.to_dict(),
             "storage_rejections": [
@@ -328,11 +332,15 @@ class Simulation:
         messages: tuple[Message, ...],
         encounters: tuple[Encounter, ...],
         seed: int,
+        scenario: str = "custom",
+        scenario_parameters: tuple[tuple[str, int], ...] = (),
     ) -> None:
         self._node_ids = node_ids
         self._messages = messages
         self._encounters = encounters
         self._seed = seed
+        self._scenario = scenario
+        self._scenario_parameters = scenario_parameters
         self._validate()
 
     def _validate(self) -> None:
@@ -356,6 +364,24 @@ class Simulation:
             raise SimulationValidationError(
                 f"seed must be between 0 and {MAX_SEED}"
             )
+
+        validate_node_id(self._scenario)
+        parameter_names: set[str] = set()
+        for name, value in self._scenario_parameters:
+            validate_node_id(name)
+            if name in parameter_names:
+                raise SimulationValidationError(
+                    f"duplicate scenario parameter: {name!r}"
+                )
+            parameter_names.add(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise SimulationValidationError(
+                    f"scenario parameter {name!r} must be an integer"
+                )
+            if value < 0:
+                raise SimulationValidationError(
+                    f"scenario parameter {name!r} must not be negative"
+                )
 
         known_nodes: set[str] = set()
         for node_id in self._node_ids:
@@ -552,6 +578,8 @@ class Simulation:
 
         return SimulationResult(
             seed=self._seed,
+            scenario=self._scenario,
+            scenario_parameters=self._scenario_parameters,
             policy=policy.name,
             policy_parameters=policy.parameters,
             network_conditions=conditions,
