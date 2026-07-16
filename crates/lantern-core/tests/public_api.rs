@@ -2,7 +2,7 @@
 
 use lantern_core::{
     ContainerState, Envelope, INITIAL_COPY_BUDGET, LocalRouteRecord, NORMAL_PRIORITY,
-    PROTOCOL_VERSION,
+    PROTOCOL_VERSION, decode_envelope, encode_envelope,
 };
 
 fn test_envelope() -> Envelope {
@@ -45,4 +45,15 @@ fn public_debug_output_does_not_include_test_payload_or_identifiers() {
     assert!(!output.contains("OBVIOUS TEST PAYLOAD"));
     assert!(!output.contains("17, 17"));
     assert!(!output.contains("34, 34"));
+}
+
+#[test]
+fn public_cbor_api_round_trips_one_immutable_envelope() {
+    let envelope = test_envelope();
+    let encoded = encode_envelope(&envelope);
+    let Ok(encoded) = encoded else {
+        panic!("valid integration Envelope was not encoded");
+    };
+
+    assert_eq!(decode_envelope(&encoded), Ok(envelope));
 }

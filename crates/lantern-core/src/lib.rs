@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Bounded, transport-independent domain types for Lantern.
+//! Bounded, transport-independent domain types and strict CBOR serialization
+//! for Lantern.
 //!
-//! This crate does not implement serialization, networking, persistent storage,
-//! or cryptography. `protected_payload` is opaque test data until the separate
-//! cryptographic milestone is completed.
+//! This crate does not implement networking, persistent storage, or cryptography.
+//! `protected_payload` is opaque test data until the separate cryptographic
+//! milestone is completed.
 
 #![forbid(unsafe_code)]
 
+mod cbor;
 mod envelope;
 mod error;
 mod route;
 
+pub use cbor::{CborError, CborField, decode_envelope, encode_envelope};
 pub use envelope::{
     Envelope, MaxHops, MessageId, Priority, ProtectedPayload, RecipientHint, TtlSeconds,
 };
