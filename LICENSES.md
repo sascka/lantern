@@ -20,19 +20,29 @@ Lantern будет использовать несколько лицензий 
 | спецификация протокола | Creative Commons Attribution 4.0 | `CC-BY-4.0` |
 | остальные документы | Creative Commons Attribution-ShareAlike 4.0 | `CC-BY-SA-4.0` |
 
-В репозитории есть документы, исследовательский Python-симулятор и первый
-библиотечный crate Lantern Core. Для них лицензии указаны через SPDX-комментарии
-в начале файлов. Лицензия будущих приложений начнёт действовать, когда появятся
-соответствующие файлы с лицензионными уведомлениями.
+В репозитории есть документы, исследовательский Python-симулятор и два
+библиотечных crate: `lantern-core` и `lantern-storage`. Для них лицензии указаны
+через SPDX-комментарии в начале файлов. Лицензия будущих приложений начнёт
+действовать, когда появятся соответствующие файлы с лицензионными
+уведомлениями.
 
-Lantern Core использует одну стороннюю Rust-зависимость:
+Прямые сторонние Rust-зависимости workspace:
 
 | Зависимость | Версия | Features | Транзитивные зависимости | Лицензия |
 | --- | --- | --- | --- | --- |
 | `minicbor` | `2.2.2` | только `alloc` | нет | `BlueOak-1.0.0` |
+| `rusqlite` | `0.40.1` | `bundled`, `limits` | 10 пакетов | `MIT` |
 
-Версия зафиксирована точно в `Cargo.toml` и `Cargo.lock`. Default features
-отключены. Исходный проект: <https://github.com/twittner/minicbor>.
+Версии зафиксированы точно в `Cargo.toml` и `Cargo.lock`. Default features у
+обеих зависимостей отключены. Исходные проекты:
+
+- `minicbor`: <https://github.com/twittner/minicbor>;
+- `rusqlite`: <https://github.com/rusqlite/rusqlite>.
+
+`rusqlite` собирает bundled SQLite 3.53.2 через `libsqlite3-sys` 0.38.1. Полное
+дерево, версии, выбранные варианты MIT и copyright-уведомления сохранены в
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). SQLite находится в public
+domain согласно официальному уведомлению проекта.
 
 ## Приложения и сервер
 
@@ -100,6 +110,7 @@ ROADMAP.md
 CONTRIBUTING.md
 CODE_OF_CONDUCT.md
 LICENSES.md
+THIRD_PARTY_NOTICES.md
 ```
 
 Будущие общие документы по умолчанию получают ту же лицензию, если в самом
@@ -166,11 +177,14 @@ SPDX-License-Identifier: CC-BY-SA-4.0
 - CC BY 4.0: <https://creativecommons.org/licenses/by/4.0/legalcode>
 - CC BY-SA 4.0: <https://creativecommons.org/licenses/by-sa/4.0/legalcode>
 - Blue Oak Model License 1.0.0: <https://blueoakcouncil.org/license/1.0.0>
+- MIT License: <https://opensource.org/license/mit>
+- статус SQLite: <https://www.sqlite.org/copyright.html>
 
 Полные тексты сохранены в каталоге `LICENSES/`. Основные лицензии проекта
 получены из официальных источников 16 июля 2026 года. Текст Blue Oak получен из
 пакета `minicbor` 2.2.2 и сверен с опубликованной версией лицензии 17 июля 2026
-года.
+года. MIT-уведомления получены из пакетов, зафиксированных в `Cargo.lock`, 17
+июля 2026 года.
 
 | Файл | SHA-256 |
 | --- | --- |
@@ -179,6 +193,7 @@ SPDX-License-Identifier: CC-BY-SA-4.0
 | `LICENSES/CC-BY-4.0.txt` | `9ba9550ad48438d0836ddab3da480b3b69ffa0aac7b7878b5a0039e7ab429411` |
 | `LICENSES/CC-BY-SA-4.0.txt` | `28a9529c7d0bb4dc51f4bf5c116a3d16ef247a052f7591466768ddf563fd1cf5` |
 | `LICENSES/BlueOak-1.0.0.txt` | `8a1af140fdfbf5afd3df27f7e662f989c5b963a300020dfafce42033cae9e004` |
+| `LICENSES/MIT-third-party.txt` | `90f6feae8cf0db7a1641e504955018f638b6c9027db96c818d1cc2bc4a8f12c3` |
 
 Хеши позволяют проверить, что юридические тексты не были случайно изменены при
 редактировании остальных документов.
@@ -189,6 +204,8 @@ SPDX-License-Identifier: CC-BY-SA-4.0
 - Граница между AGPL-приложением и MPL-библиотекой должна оставаться явной.
 - Разрешительная лицензия `minicbor` не создаёт видимого конфликта с MPL 2.0,
   но это не является заключением юриста.
+- Выбор MIT для `rusqlite` и dual-licensed транзитивных пакетов не создаёт
+  видимого конфликта с MPL 2.0, но это не является заключением юриста.
 - Совместимость будущих криптографических, сетевых и других зависимостей ещё не
   проверена.
 - Документы не проходили проверку юристом.
