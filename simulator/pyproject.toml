@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: MPL-2.0
+
+[tool.pytest.ini_options]
+minversion = "9.1"
+addopts = ["--strict-config", "--strict-markers", "-ra"]
+testpaths = ["tests"]
