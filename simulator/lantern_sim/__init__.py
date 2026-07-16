@@ -9,7 +9,13 @@ from lantern_sim.model import (
     NodeState,
     StoredMessage,
 )
-from lantern_sim.routing import DirectDelivery, EpidemicRouting, RoutingPolicy
+from lantern_sim.routing import (
+    BinarySprayAndWait,
+    DirectDelivery,
+    EpidemicRouting,
+    ForwardingDecision,
+    RoutingPolicy,
+)
 from lantern_sim.simulation import (
     BlockReason,
     RemovalReason,
@@ -19,9 +25,11 @@ from lantern_sim.simulation import (
 
 __all__ = [
     "DirectDelivery",
+    "BinarySprayAndWait",
     "BlockReason",
     "Encounter",
     "EpidemicRouting",
+    "ForwardingDecision",
     "Message",
     "MessageIdGenerator",
     "NodeState",

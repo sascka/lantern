@@ -124,6 +124,38 @@ def test_forwarded_copy_decreases_ttl_and_increases_hops() -> None:
     assert forwarded.message == origin.message
 
 
+def test_forwarded_copy_preserves_bounded_copy_mode() -> None:
+    origin = StoredMessage.from_origin(make_message(), copies_left=4)
+
+    forwarded = origin.forwarded_copy(at=10, copies_left=2)
+
+    assert forwarded.copies_left == 2
+    with pytest.raises(SimulationValidationError, match="copy-budget mode"):
+        origin.forwarded_copy(at=10)
+
+
+@pytest.mark.parametrize("copies_left", [0, 65, True])
+def test_stored_message_rejects_invalid_copy_count(copies_left: object) -> None:
+    with pytest.raises(SimulationValidationError, match="copies_left"):
+        StoredMessage.from_origin(
+            make_message(), copies_left=copies_left  # type: ignore[arg-type]
+        )
+
+
+def test_node_updates_copy_budget_without_changing_storage_size() -> None:
+    node = NodeState("alice")
+    message = make_message()
+    node.store_origin(message, copies_left=4)
+    original = node.get_message(message.message_id)
+    assert original is not None
+
+    updated = node.update_copies_left(original, 2)
+
+    assert updated.copies_left == 2
+    assert node.message_count == 1
+    assert node.stored_bytes == message.payload_size
+
+
 def test_node_removes_expired_copy_and_updates_storage() -> None:
     node = NodeState("relay")
     message = make_message(ttl_seconds=60)

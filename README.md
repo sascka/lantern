@@ -89,9 +89,9 @@ Android, группы, карты, SOS, интернет-реле, Tor, BLE, Wi-
 ## Текущий порядок работы
 
 Этапы, их состав и условия перехода записаны в [ROADMAP.md](ROADMAP.md).
-Этап 0 завершён. На Этапе 1 уже работает первый детерминированный сценарий
-Alice -> Relay -> Bob для Direct Delivery и Epidemic. Инструкция находится в
-[simulator/README.md](simulator/README.md).
+Этап 0 завершён. На Этапе 1 уже работает детерминированный сценарий
+Alice -> Relay -> Bob для Direct Delivery, Epidemic и Binary Spray-and-Wait.
+Инструкция находится в [simulator/README.md](simulator/README.md).
 
 ## Участие в разработке
 

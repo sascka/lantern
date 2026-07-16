@@ -20,6 +20,9 @@ DEFAULT_TTL_SECONDS = 300
 MIN_HOPS = 1
 MAX_HOPS = 16
 DEFAULT_MAX_HOPS = 16
+MIN_COPY_BUDGET = 1
+MAX_COPY_BUDGET = 64
+DEFAULT_COPY_BUDGET = 4
 
 _NODE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 _MESSAGE_ID_PATTERN = re.compile(r"[0-9a-f]{32}", re.ASCII)
@@ -122,6 +125,7 @@ class StoredMessage:
     received_at: int
     remaining_ttl: int
     hops_taken: int
+    copies_left: int | None = None
 
     def __post_init__(self) -> None:
         _validate_non_negative_time(self.received_at, "received_at")
@@ -141,14 +145,24 @@ class StoredMessage:
             minimum=0,
             maximum=self.message.max_hops,
         )
+        if self.copies_left is not None:
+            _validate_bounded_integer(
+                self.copies_left,
+                field_name="copies_left",
+                minimum=MIN_COPY_BUDGET,
+                maximum=MAX_COPY_BUDGET,
+            )
 
     @classmethod
-    def from_origin(cls, message: Message) -> StoredMessage:
+    def from_origin(
+        cls, message: Message, *, copies_left: int | None = None
+    ) -> StoredMessage:
         return cls(
             message=message,
             received_at=message.created_at,
             remaining_ttl=message.ttl_seconds,
             hops_taken=0,
+            copies_left=copies_left,
         )
 
     def remaining_ttl_at(self, at: int) -> int:
@@ -159,18 +173,38 @@ class StoredMessage:
             )
         return max(0, self.remaining_ttl - (at - self.received_at))
 
-    def forwarded_copy(self, at: int) -> StoredMessage:
+    def forwarded_copy(
+        self, at: int, *, copies_left: int | None = None
+    ) -> StoredMessage:
         remaining_ttl = self.remaining_ttl_at(at)
         if remaining_ttl == 0:
             raise SimulationValidationError("cannot forward an expired message")
         if self.hops_taken >= self.message.max_hops:
             raise SimulationValidationError("cannot exceed max_hops")
+        if (self.copies_left is None) != (copies_left is None):
+            raise SimulationValidationError(
+                "forwarded copy must preserve copy-budget mode"
+            )
 
         return StoredMessage(
             message=self.message,
             received_at=at,
             remaining_ttl=remaining_ttl,
             hops_taken=self.hops_taken + 1,
+            copies_left=copies_left,
+        )
+
+    def with_copies_left(self, copies_left: int) -> StoredMessage:
+        if self.copies_left is None:
+            raise SimulationValidationError(
+                "cannot add a copy budget to an unbounded routing copy"
+            )
+        return StoredMessage(
+            message=self.message,
+            received_at=self.received_at,
+            remaining_ttl=self.remaining_ttl,
+            hops_taken=self.hops_taken,
+            copies_left=copies_left,
         )
 
 
@@ -245,8 +279,12 @@ class NodeState:
     def messages(self) -> tuple[StoredMessage, ...]:
         return tuple(self._messages[key] for key in sorted(self._messages))
 
-    def store_origin(self, message: Message) -> bool:
-        return self._store(StoredMessage.from_origin(message))
+    def store_origin(
+        self, message: Message, *, copies_left: int | None = None
+    ) -> bool:
+        return self._store(
+            StoredMessage.from_origin(message, copies_left=copies_left)
+        )
 
     def store_forwarded(self, stored_message: StoredMessage) -> bool:
         return self._store(stored_message)
@@ -279,6 +317,19 @@ class NodeState:
         if stored_message is not None:
             self._stored_bytes -= stored_message.message.payload_size
         return stored_message
+
+    def update_copies_left(
+        self, expected: StoredMessage, copies_left: int
+    ) -> StoredMessage:
+        message_id = expected.message.message_id
+        current = self._messages.get(message_id)
+        if current != expected:
+            raise SimulationValidationError(
+                "cannot update copy budget for a stale local copy"
+            )
+        updated = expected.with_copies_left(copies_left)
+        self._messages[message_id] = updated
+        return updated
 
     def remove_expired(self, at: int) -> tuple[StoredMessage, ...]:
         expired_ids = tuple(

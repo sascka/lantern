@@ -10,7 +10,7 @@ from lantern_sim.model import (
     MessageIdGenerator,
     SimulationValidationError,
 )
-from lantern_sim.routing import DirectDelivery, EpidemicRouting
+from lantern_sim.routing import BinarySprayAndWait, DirectDelivery, EpidemicRouting
 from lantern_sim.scenarios import run_three_node_chain
 from lantern_sim.simulation import BlockReason, RemovalReason, Simulation
 
@@ -238,3 +238,82 @@ def test_result_serializes_expiration_and_hop_block_reasons() -> None:
     assert blocked["blocked_transfers"][0]["reason"] == (
         "hop_limit_before_destination"
     )
+
+
+def test_spray_and_wait_delivers_chain_with_two_copy_tokens() -> None:
+    result = run_three_node_chain(
+        BinarySprayAndWait(copy_budget=2), seed=42, payload_size=128
+    )
+
+    assert result.delivered_count == 1
+    assert result.transmission_count == 2
+    assert result.peak_stored_messages == 2
+    assert result.policy_parameters == (("copy_budget", 2),)
+    assert [item.sender_copies_left_after for item in result.transmissions] == [
+        1,
+        0,
+    ]
+    assert [item.receiver_copies_left for item in result.transmissions] == [1, 1]
+
+
+def test_spray_and_wait_with_one_token_cannot_use_relay() -> None:
+    result = run_three_node_chain(
+        BinarySprayAndWait(copy_budget=1), seed=42, payload_size=128
+    )
+
+    assert result.delivered_count == 0
+    assert result.transmission_count == 0
+    assert result.peak_stored_messages == 1
+
+
+def test_blocked_hop_does_not_consume_spray_copy_tokens() -> None:
+    simulation = Simulation(
+        node_ids=("alice", "relay", "bob"),
+        messages=(make_message(max_hops=1),),
+        encounters=(
+            Encounter(at=10, left="alice", right="relay"),
+            Encounter(at=20, left="alice", right="bob"),
+        ),
+        seed=42,
+    )
+
+    result = simulation.run(BinarySprayAndWait(copy_budget=2))
+
+    assert result.delivered_count == 1
+    assert result.transmission_count == 1
+    assert len(result.blocked_transfers) == 1
+    assert result.transmissions[0].sender_copies_left_after == 1
+    assert result.transmissions[0].receiver_copies_left == 1
+
+
+def test_binary_spray_never_exceeds_copy_budget() -> None:
+    simulation = Simulation(
+        node_ids=("alice", "relay1", "relay2", "relay3", "bob"),
+        messages=(make_message(),),
+        encounters=(
+            Encounter(at=10, left="alice", right="relay1"),
+            Encounter(at=20, left="alice", right="relay2"),
+            Encounter(at=30, left="relay1", right="relay3"),
+            Encounter(at=40, left="relay3", right="bob"),
+        ),
+        seed=42,
+    )
+
+    result = simulation.run(BinarySprayAndWait(copy_budget=4))
+
+    assert result.delivered_count == 1
+    assert result.transmission_count == 4
+    assert result.peak_stored_messages == 4
+    assert result.peak_stored_bytes == 4 * 128
+    assert all(
+        item.receiver_copies_left is not None for item in result.transmissions
+    )
+
+
+def test_result_serializes_spray_policy_parameters() -> None:
+    result = run_three_node_chain(BinarySprayAndWait(copy_budget=2), seed=42)
+
+    serialized = result.to_dict()
+
+    assert serialized["policy"] == "spray_and_wait"
+    assert serialized["policy_parameters"] == {"copy_budget": 2}

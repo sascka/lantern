@@ -9,12 +9,18 @@ import json
 from collections.abc import Sequence
 
 from lantern_sim.model import (
+    DEFAULT_COPY_BUDGET,
     DEFAULT_MAX_HOPS,
     DEFAULT_TTL_SECONDS,
     SimulationLimitError,
     SimulationValidationError,
 )
-from lantern_sim.routing import DirectDelivery, EpidemicRouting, RoutingPolicy
+from lantern_sim.routing import (
+    BinarySprayAndWait,
+    DirectDelivery,
+    EpidemicRouting,
+    RoutingPolicy,
+)
 from lantern_sim.scenarios import DEFAULT_SEED, run_three_node_chain
 
 
@@ -24,7 +30,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--policy",
-        choices=("direct", "epidemic"),
+        choices=("direct", "epidemic", "spray"),
         default="epidemic",
         help="routing policy to compare",
     )
@@ -52,18 +58,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_HOPS,
         help="maximum number of sequential transmissions",
     )
+    parser.add_argument(
+        "--copy-budget",
+        type=int,
+        default=DEFAULT_COPY_BUDGET,
+        help="initial copy-token budget for Spray-and-Wait",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    policies: dict[str, RoutingPolicy] = {
-        "direct": DirectDelivery(),
-        "epidemic": EpidemicRouting(),
-    }
-
     try:
+        policies: dict[str, RoutingPolicy] = {
+            "direct": DirectDelivery(),
+            "epidemic": EpidemicRouting(),
+            "spray": BinarySprayAndWait(args.copy_budget),
+        }
         result = run_three_node_chain(
             policies[args.policy],
             seed=args.seed,

@@ -13,10 +13,9 @@ from lantern_sim.model import (
     Message,
     NodeState,
     SimulationValidationError,
-    StoredMessage,
     validate_node_id,
 )
-from lantern_sim.routing import RoutingPolicy
+from lantern_sim.routing import ForwardingDecision, RoutingPolicy
 
 MAX_SIMULATION_NODES: Final = 10_000
 MAX_SIMULATION_MESSAGES: Final = 100_000
@@ -42,6 +41,8 @@ class Transmission:
     payload_size: int
     remaining_ttl: int
     hops_taken: int
+    sender_copies_left_after: int | None
+    receiver_copies_left: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +73,7 @@ class BlockedTransfer:
 class SimulationResult:
     seed: int
     policy: str
+    policy_parameters: tuple[tuple[str, int], ...]
     node_count: int
     message_count: int
     transmissions: tuple[Transmission, ...]
@@ -135,6 +137,7 @@ class SimulationResult:
             "peak_stored_bytes": self.peak_stored_bytes,
             "peak_stored_messages": self.peak_stored_messages,
             "policy": self.policy,
+            "policy_parameters": dict(self.policy_parameters),
             "removal_count": len(self.removals),
             "removals": [
                 {
@@ -154,8 +157,12 @@ class SimulationResult:
                     "message_id": transmission.message_id,
                     "payload_size": transmission.payload_size,
                     "receiver": transmission.receiver,
+                    "receiver_copies_left": transmission.receiver_copies_left,
                     "remaining_ttl": transmission.remaining_ttl,
                     "sender": transmission.sender,
+                    "sender_copies_left_after": (
+                        transmission.sender_copies_left_after
+                    ),
                 }
                 for transmission in self.transmissions
             ],
@@ -267,7 +274,9 @@ class Simulation:
             if event_kind == 0:
                 if not isinstance(event, Message):
                     raise AssertionError("message event has an invalid type")
-                states[event.source].store_origin(event)
+                states[event.source].store_origin(
+                    event, copies_left=policy.initial_copies_left
+                )
                 update_peaks()
                 continue
 
@@ -276,8 +285,8 @@ class Simulation:
 
             left = states[event.left]
             right = states[event.right]
-            left_to_right = policy.messages_to_forward(left, right)
-            right_to_left = policy.messages_to_forward(right, left)
+            left_to_right = policy.forwarding_decisions(left, right)
+            right_to_left = policy.forwarding_decisions(right, left)
 
             self._transfer(
                 at=at,
@@ -312,6 +321,7 @@ class Simulation:
         return SimulationResult(
             seed=self._seed,
             policy=policy.name,
+            policy_parameters=policy.parameters,
             node_count=len(states),
             message_count=len(self._messages),
             transmissions=tuple(transmissions),
@@ -346,12 +356,13 @@ class Simulation:
         at: int,
         sender: NodeState,
         receiver: NodeState,
-        messages: tuple[StoredMessage, ...],
+        messages: tuple[ForwardingDecision, ...],
         transmissions: list[Transmission],
         delivered_at: dict[str, int],
         blocked_transfers: list[BlockedTransfer],
     ) -> None:
-        for stored_message in messages:
+        for decision in messages:
+            stored_message = decision.stored_message
             message = stored_message.message
             current = sender.get_message(message.message_id)
             if current != stored_message:
@@ -386,9 +397,21 @@ class Simulation:
                 )
                 continue
 
-            forwarded_copy = stored_message.forwarded_copy(at)
+            forwarded_copy = stored_message.forwarded_copy(
+                at, copies_left=decision.receiver_copies_left
+            )
             if not receiver.store_forwarded(forwarded_copy):
                 continue
+
+            sender_copies_after = decision.sender_copies_left_after
+            if sender_copies_after == 0:
+                removed = sender.remove(message.message_id)
+                if removed != stored_message:
+                    raise SimulationValidationError(
+                        "failed to remove the expected exhausted copy"
+                    )
+            elif sender_copies_after is not None:
+                sender.update_copies_left(stored_message, sender_copies_after)
 
             transmissions.append(
                 Transmission(
@@ -399,6 +422,8 @@ class Simulation:
                     payload_size=message.payload_size,
                     remaining_ttl=forwarded_copy.remaining_ttl,
                     hops_taken=forwarded_copy.hops_taken,
+                    sender_copies_left_after=sender_copies_after,
+                    receiver_copies_left=forwarded_copy.copies_left,
                 )
             )
             if receiver.node_id == message.destination:
