@@ -3,6 +3,13 @@
 """Deterministic routing simulator for Lantern."""
 
 from lantern_sim.faults import NetworkConditions
+from lantern_sim.experiments import (
+    AggregateResult,
+    BatchExperimentConfig,
+    BatchExperimentResult,
+    CompactRunResult,
+    run_batch_experiment,
+)
 from lantern_sim.model import (
     Encounter,
     Message,
@@ -45,9 +52,13 @@ from lantern_sim.tombstones import (
 )
 
 __all__ = [
+    "AggregateResult",
     "AttemptOutcome",
+    "BatchExperimentConfig",
+    "BatchExperimentResult",
     "BinarySprayAndWait",
     "BlockReason",
+    "CompactRunResult",
     "DirectDelivery",
     "Encounter",
     "EpidemicRouting",
@@ -75,5 +86,6 @@ __all__ = [
     "TombstoneStore",
     "TransferAttempt",
     "generate_uniform_contact_scenario",
+    "run_batch_experiment",
     "run_uniform_contact_scenario",
 ]
