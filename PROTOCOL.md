@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Протокол Lantern v0.1
 
 Статус: черновик Этапа 0.

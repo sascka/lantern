@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->
+
 # Модель угроз Lantern v0.1
 
 Статус: начальная модель угроз Этапа 0.
