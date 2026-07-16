@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MPL-2.0
+
+[package]
+name = "lantern-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded transport-independent core types for Lantern"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
