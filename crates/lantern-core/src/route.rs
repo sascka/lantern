@@ -109,6 +109,75 @@ impl LocalRouteRecord {
         )
     }
 
+    /// Restore one strictly validated active route from persistent fields.
+    pub fn try_restore_stored(
+        envelope: &Envelope,
+        first_seen_at: u64,
+        local_deadline: u64,
+        remaining_ttl: u64,
+        hops_taken: u64,
+        copies_left: u64,
+    ) -> Result<Self, CoreError> {
+        if remaining_ttl == 0 {
+            return Err(CoreError::ValueBelowMinimum {
+                field: Field::RemainingTtl,
+            });
+        }
+        if remaining_ttl > u64::from(envelope.ttl_seconds().get()) {
+            return Err(CoreError::ValueAboveMaximum {
+                field: Field::RemainingTtl,
+            });
+        }
+        if hops_taken > u64::from(envelope.max_hops().get()) {
+            return Err(CoreError::ValueAboveMaximum {
+                field: Field::HopsTaken,
+            });
+        }
+        if copies_left == 0 {
+            return Err(CoreError::ValueBelowMinimum {
+                field: Field::CopiesLeft,
+            });
+        }
+        if copies_left > u64::from(INITIAL_COPY_BUDGET) {
+            return Err(CoreError::ValueAboveMaximum {
+                field: Field::CopiesLeft,
+            });
+        }
+
+        let expected_deadline =
+            first_seen_at
+                .checked_add(remaining_ttl)
+                .ok_or(CoreError::ArithmeticOverflow {
+                    field: Field::LocalDeadline,
+                })?;
+        if local_deadline != expected_deadline {
+            return Err(CoreError::UnsupportedValue {
+                field: Field::LocalDeadline,
+            });
+        }
+
+        let remaining_ttl =
+            u32::try_from(remaining_ttl).map_err(|_| CoreError::ValueAboveMaximum {
+                field: Field::RemainingTtl,
+            })?;
+        let hops_taken = u8::try_from(hops_taken).map_err(|_| CoreError::ValueAboveMaximum {
+            field: Field::HopsTaken,
+        })?;
+        let copies_left = u8::try_from(copies_left).map_err(|_| CoreError::ValueAboveMaximum {
+            field: Field::CopiesLeft,
+        })?;
+
+        Ok(Self {
+            message_id: envelope.message_id(),
+            first_seen_at,
+            local_deadline,
+            remaining_ttl,
+            hops_taken,
+            copies_left,
+            state: ContainerState::Stored,
+        })
+    }
+
     fn from_bounded_values(
         envelope: &Envelope,
         first_seen_at: u64,
@@ -281,5 +350,35 @@ mod tests {
         assert!(!output.contains("123456789"));
         assert!(!output.contains(&record.local_deadline().to_string()));
         assert!(output.contains("redacted"));
+    }
+
+    #[test]
+    fn persistent_restore_rejects_inconsistent_or_unbounded_fields() {
+        let envelope = test_envelope();
+        assert!(LocalRouteRecord::try_restore_stored(&envelope, 100, 160, 60, 1, 1).is_ok());
+        assert_eq!(
+            LocalRouteRecord::try_restore_stored(&envelope, 100, 161, 60, 1, 1),
+            Err(CoreError::UnsupportedValue {
+                field: Field::LocalDeadline,
+            })
+        );
+        assert_eq!(
+            LocalRouteRecord::try_restore_stored(&envelope, 100, 100, 0, 1, 1),
+            Err(CoreError::ValueBelowMinimum {
+                field: Field::RemainingTtl,
+            })
+        );
+        assert_eq!(
+            LocalRouteRecord::try_restore_stored(&envelope, 100, 160, 60, 17, 1),
+            Err(CoreError::ValueAboveMaximum {
+                field: Field::HopsTaken,
+            })
+        );
+        assert_eq!(
+            LocalRouteRecord::try_restore_stored(&envelope, 100, 160, 60, 1, 33),
+            Err(CoreError::ValueAboveMaximum {
+                field: Field::CopiesLeft,
+            })
+        );
     }
 }

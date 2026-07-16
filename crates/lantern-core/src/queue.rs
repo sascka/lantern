@@ -28,6 +28,7 @@ pub enum QueueError {
     RouteNotStored,
     ArithmeticOverflow { field: QueueField },
     EnvelopeEncoding(CborError),
+    InvalidSnapshot,
     InvariantViolation,
 }
 
@@ -45,6 +46,7 @@ impl fmt::Display for QueueError {
             Self::EnvelopeEncoding(error) => {
                 write!(formatter, "could not measure encoded Envelope: {error}")
             }
+            Self::InvalidSnapshot => formatter.write_str("invalid queue snapshot"),
             Self::InvariantViolation => formatter.write_str("queue invariant violation"),
         }
     }
@@ -137,7 +139,7 @@ pub struct QueueEntry {
 }
 
 impl QueueEntry {
-    fn try_new(envelope: Envelope, route: LocalRouteRecord) -> Result<Self, QueueError> {
+    pub fn try_from_parts(envelope: Envelope, route: LocalRouteRecord) -> Result<Self, QueueError> {
         if envelope.message_id() != route.message_id() {
             return Err(QueueError::RouteMessageIdMismatch);
         }
@@ -191,6 +193,21 @@ pub struct TombstoneEntry {
 }
 
 impl TombstoneEntry {
+    pub fn try_from_parts(
+        message_id: MessageId,
+        recorded_at: u64,
+        expires_at: u64,
+    ) -> Result<Self, QueueError> {
+        if expires_at <= recorded_at {
+            return Err(QueueError::InvalidSnapshot);
+        }
+        Ok(Self {
+            message_id,
+            recorded_at,
+            expires_at,
+        })
+    }
+
     pub const fn message_id(self) -> MessageId {
         self.message_id
     }
@@ -301,6 +318,51 @@ impl EnvelopeQueue {
         }
     }
 
+    /// Restore an already decoded snapshot without applying eviction policy.
+    pub fn try_restore(
+        limits: QueueLimits,
+        entries: Vec<QueueEntry>,
+        tombstones: Vec<TombstoneEntry>,
+    ) -> Result<Self, QueueError> {
+        if entries.len() > limits.max_entries || tombstones.len() > limits.max_tombstones {
+            return Err(QueueError::InvalidSnapshot);
+        }
+
+        let mut queue = Self::new(limits);
+        for entry in entries {
+            let message_id = entry.envelope().message_id();
+            let fifo_key = (entry.route().first_seen_at(), message_id);
+            let next_bytes = queue
+                .stored_bytes
+                .checked_add(entry.encoded_size())
+                .ok_or(QueueError::InvalidSnapshot)?;
+            if next_bytes > limits.max_bytes
+                || queue.entries.contains_key(&message_id)
+                || queue.fifo_order.contains(&fifo_key)
+            {
+                return Err(QueueError::InvalidSnapshot);
+            }
+            queue.entries.insert(message_id, entry);
+            queue.fifo_order.insert(fifo_key);
+            queue.stored_bytes = next_bytes;
+        }
+
+        for tombstone in tombstones {
+            let retention = tombstone
+                .expires_at
+                .checked_sub(tombstone.recorded_at)
+                .ok_or(QueueError::InvalidSnapshot)?;
+            if retention > limits.tombstone_retention_seconds
+                || queue.entries.contains_key(&tombstone.message_id)
+                || queue.tombstones.contains_key(&tombstone.message_id)
+            {
+                return Err(QueueError::InvalidSnapshot);
+            }
+            queue.tombstones.insert(tombstone.message_id, tombstone);
+        }
+        Ok(queue)
+    }
+
     pub const fn limits(&self) -> QueueLimits {
         self.limits
     }
@@ -349,7 +411,7 @@ impl EnvelopeQueue {
         route: LocalRouteRecord,
         at: u64,
     ) -> Result<EnqueueResult, QueueError> {
-        let incoming = QueueEntry::try_new(envelope, route)?;
+        let incoming = QueueEntry::try_from_parts(envelope, route)?;
         let incoming_id = incoming.envelope().message_id();
         let incoming_expired = incoming.route().local_deadline() <= at;
 
@@ -499,6 +561,39 @@ impl EnvelopeQueue {
         };
 
         for message_id in due_ids {
+            let mut removed = self.remove_active(message_id)?;
+            removed.transition_to(ContainerState::Expired)?;
+            let evicted_tombstone = self.record_tombstone(
+                message_id,
+                at,
+                tombstone_deadline.ok_or(QueueError::InvariantViolation)?,
+            );
+            effects.removed_entries.push(removed);
+            if let Some(tombstone) = evicted_tombstone {
+                effects.evicted_tombstones.push(tombstone);
+            }
+        }
+        Ok(effects)
+    }
+
+    /// Conservatively expire every active entry after a detected clock rollback.
+    pub fn expire_all(&mut self, at: u64) -> Result<QueueEffects, QueueError> {
+        let message_ids: Vec<MessageId> = self
+            .fifo_order
+            .iter()
+            .map(|(_, message_id)| *message_id)
+            .collect();
+        let tombstone_deadline = if message_ids.is_empty() {
+            None
+        } else {
+            Some(self.tombstone_deadline(at)?)
+        };
+        let mut effects = QueueEffects {
+            expired_tombstones: self.purge_expired_tombstones(at),
+            ..QueueEffects::default()
+        };
+
+        for message_id in message_ids {
             let mut removed = self.remove_active(message_id)?;
             removed.transition_to(ContainerState::Expired)?;
             let evicted_tombstone = self.record_tombstone(
@@ -1162,6 +1257,91 @@ mod tests {
                     .all(|entry| entry.route().state() == ContainerState::Stored)
             );
         }
+    }
+
+    #[test]
+    fn validated_snapshot_round_trip_preserves_entries_and_tombstones() {
+        let limits = small_limits(4, 4_000, 4);
+        let mut queue = EnvelopeQueue::new(limits);
+        enqueue_fixture(&mut queue, 1, 10, 10);
+        enqueue_fixture(&mut queue, 2, 20, 20);
+        let removed = queue.remove_opened(MessageId::from_bytes(message_id(2)), 30);
+        assert!(removed.is_ok());
+        let entries = queue.entries().cloned().collect();
+        let tombstones = queue.tombstones().copied().collect();
+
+        let restored = EnvelopeQueue::try_restore(limits, entries, tombstones);
+        let Ok(restored) = restored else {
+            panic!("valid queue snapshot could not be restored");
+        };
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored.tombstone_count(), 1);
+        assert_eq!(restored.stored_bytes(), queue.stored_bytes());
+        assert!(restored.get(MessageId::from_bytes(message_id(1))).is_some());
+    }
+
+    #[test]
+    fn snapshot_restore_rejects_duplicates_overlap_and_excess_bytes() {
+        let envelope = test_envelope(1, 10, 300);
+        let route = LocalRouteRecord::for_origin(&envelope, 10);
+        let Ok(route) = route else {
+            panic!("valid route fixture was rejected");
+        };
+        let entry = QueueEntry::try_from_parts(envelope, route);
+        let Ok(entry) = entry else {
+            panic!("valid queue entry fixture was rejected");
+        };
+        let limits = small_limits(2, 2_000, 2);
+        assert!(matches!(
+            EnvelopeQueue::try_restore(limits, vec![entry.clone(), entry.clone()], vec![]),
+            Err(QueueError::InvalidSnapshot)
+        ));
+
+        let tombstone = TombstoneEntry::try_from_parts(
+            entry.envelope().message_id(),
+            20,
+            20 + limits.tombstone_retention_seconds(),
+        );
+        let Ok(tombstone) = tombstone else {
+            panic!("valid tombstone fixture was rejected");
+        };
+        assert!(matches!(
+            EnvelopeQueue::try_restore(limits, vec![entry.clone()], vec![tombstone]),
+            Err(QueueError::InvalidSnapshot)
+        ));
+
+        let tight_limits = small_limits(2, entry.encoded_size() - 1, 2);
+        assert!(matches!(
+            EnvelopeQueue::try_restore(tight_limits, vec![entry], vec![]),
+            Err(QueueError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
+    fn expire_all_transitions_entries_and_keeps_bounded_tombstones() {
+        let mut queue = EnvelopeQueue::new(small_limits(4, 4_000, 4));
+        enqueue_fixture(&mut queue, 1, 1, 1);
+        enqueue_fixture(&mut queue, 2, 2, 2);
+        enqueue_fixture(&mut queue, 3, 3, 3);
+        assert!(
+            queue
+                .remove_opened(MessageId::from_bytes(message_id(3)), 10)
+                .is_ok()
+        );
+
+        let effects = queue.expire_all(20);
+        let Ok(effects) = effects else {
+            panic!("conservative expiration failed");
+        };
+        assert_eq!(effects.removed_entries().len(), 2);
+        assert!(
+            effects
+                .removed_entries()
+                .iter()
+                .all(|entry| entry.route().state() == ContainerState::Expired)
+        );
+        assert!(queue.is_empty());
+        assert_eq!(queue.tombstone_count(), 3);
     }
 
     #[test]
