@@ -20,7 +20,9 @@ from lantern_sim.simulation import (
     BlockReason,
     RemovalReason,
     Simulation,
+    TombstoneEventReason,
 )
+from lantern_sim.tombstones import TombstoneConfig
 
 
 def make_message(
@@ -509,4 +511,163 @@ def test_item_larger_than_quota_is_rejected_without_network_attempt() -> None:
     assert result.to_dict()["storage_quota"] == {
         "max_bytes": 128,
         "max_messages": 2,
+    }
+
+
+def test_tombstone_blocks_immediate_return_after_quota_eviction() -> None:
+    first = Message(
+        message_id="0" * 32,
+        source="alice",
+        destination="relay",
+        created_at=0,
+        payload_size=128,
+    )
+    second = Message(
+        message_id="1" * 32,
+        source="carol",
+        destination="relay",
+        created_at=1,
+        payload_size=128,
+    )
+    simulation = Simulation(
+        node_ids=("alice", "carol", "relay"),
+        messages=(first, second),
+        encounters=(
+            Encounter(at=10, left="alice", right="relay"),
+            Encounter(at=20, left="carol", right="relay"),
+            Encounter(at=30, left="alice", right="relay"),
+        ),
+        seed=42,
+    )
+
+    result = simulation.run(
+        DirectDelivery(),
+        storage_quota=StorageQuota(max_messages=1, max_bytes=128),
+        tombstone_config=TombstoneConfig(
+            max_entries=2, retention_seconds=60
+        ),
+    )
+
+    assert result.attempt_count == 3
+    assert result.transmission_count == 2
+    assert result.eviction_count == 1
+    assert result.tombstone_rejection_count == 1
+    assert result.attempts[-1].outcome is AttemptOutcome.TOMBSTONE_REJECTED
+    assert result.tombstone_rejections[0].message_id == first.message_id
+    assert result.peak_node_tombstones == 1
+
+
+def test_ttl_expiration_creates_tombstone_on_each_honest_holder() -> None:
+    simulation = Simulation(
+        node_ids=("alice", "relay", "bob"),
+        messages=(make_message(ttl_seconds=60),),
+        encounters=(
+            Encounter(at=10, left="alice", right="relay"),
+            Encounter(at=60, left="relay", right="bob"),
+        ),
+        seed=42,
+    )
+
+    result = simulation.run(
+        EpidemicRouting(),
+        tombstone_config=TombstoneConfig(
+            max_entries=2, retention_seconds=60
+        ),
+    )
+
+    assert result.transmission_count == 1
+    assert result.delivered_count == 0
+    assert [item.reason for item in result.removals] == [
+        RemovalReason.TTL_EXPIRED,
+        RemovalReason.TTL_EXPIRED,
+    ]
+    assert result.peak_node_tombstones == 1
+
+
+def test_expired_tombstone_allows_message_to_return() -> None:
+    first = Message(
+        message_id="0" * 32,
+        source="alice",
+        destination="relay",
+        created_at=0,
+        payload_size=128,
+    )
+    second = Message(
+        message_id="1" * 32,
+        source="carol",
+        destination="relay",
+        created_at=1,
+        payload_size=128,
+    )
+    simulation = Simulation(
+        node_ids=("alice", "carol", "relay"),
+        messages=(first, second),
+        encounters=(
+            Encounter(at=10, left="alice", right="relay"),
+            Encounter(at=20, left="carol", right="relay"),
+            Encounter(at=81, left="alice", right="relay"),
+        ),
+        seed=42,
+    )
+
+    result = simulation.run(
+        DirectDelivery(),
+        storage_quota=StorageQuota(max_messages=1, max_bytes=128),
+        tombstone_config=TombstoneConfig(
+            max_entries=2, retention_seconds=60
+        ),
+    )
+
+    assert result.transmission_count == 3
+    assert result.eviction_count == 2
+    assert result.tombstone_rejection_count == 0
+    assert any(
+        event.message_id == first.message_id
+        and event.reason is TombstoneEventReason.EXPIRED
+        for event in result.tombstone_events
+    )
+
+
+def test_bounded_tombstones_evict_oldest_record() -> None:
+    messages = tuple(
+        Message(
+            message_id=f"{index:032x}",
+            source=f"source{index}",
+            destination="relay",
+            created_at=index,
+            payload_size=128,
+        )
+        for index in range(3)
+    )
+    simulation = Simulation(
+        node_ids=("source0", "source1", "source2", "relay"),
+        messages=messages,
+        encounters=(
+            Encounter(at=10, left="source0", right="relay"),
+            Encounter(at=20, left="source1", right="relay"),
+            Encounter(at=30, left="source2", right="relay"),
+            Encounter(at=40, left="source0", right="relay"),
+        ),
+        seed=42,
+    )
+
+    result = simulation.run(
+        DirectDelivery(),
+        storage_quota=StorageQuota(max_messages=1, max_bytes=128),
+        tombstone_config=TombstoneConfig(
+            max_entries=1, retention_seconds=300
+        ),
+    )
+
+    assert result.transmission_count == 4
+    assert result.tombstone_rejection_count == 0
+    assert result.peak_node_tombstones == 1
+    assert any(
+        event.message_id == messages[0].message_id
+        and event.reason is TombstoneEventReason.CAPACITY_EVICTED
+        for event in result.tombstone_events
+    )
+    assert result.to_dict()["tombstone_config"] == {
+        "max_entries": 1,
+        "retention_seconds": 300,
     }

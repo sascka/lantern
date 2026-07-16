@@ -96,6 +96,17 @@ def validate_node_id(node_id: str) -> None:
         )
 
 
+def validate_message_id(message_id: str) -> None:
+    """Validate the fixed simulation message identifier format."""
+
+    if not isinstance(message_id, str):
+        raise SimulationValidationError("message_id must be a string")
+    if _MESSAGE_ID_PATTERN.fullmatch(message_id) is None:
+        raise SimulationValidationError(
+            "message_id must contain exactly 32 lowercase hexadecimal characters"
+        )
+
+
 def _validate_non_negative_time(value: int, field_name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise SimulationValidationError(f"{field_name} must be an integer")
@@ -127,13 +138,7 @@ class Message:
     max_hops: int = DEFAULT_MAX_HOPS
 
     def __post_init__(self) -> None:
-        if not isinstance(self.message_id, str):
-            raise SimulationValidationError("message_id must be a string")
-        if _MESSAGE_ID_PATTERN.fullmatch(self.message_id) is None:
-            raise SimulationValidationError(
-                "message_id must contain exactly 32 lowercase hexadecimal characters"
-            )
-
+        validate_message_id(self.message_id)
         validate_node_id(self.source)
         validate_node_id(self.destination)
         if self.source == self.destination:

@@ -15,6 +15,7 @@ from lantern_sim.model import (
 )
 from lantern_sim.routing import RoutingPolicy
 from lantern_sim.simulation import Simulation, SimulationResult
+from lantern_sim.tombstones import TombstoneConfig
 
 DEFAULT_SEED = 20_260_716
 
@@ -28,6 +29,7 @@ def run_three_node_chain(
     max_hops: int = DEFAULT_MAX_HOPS,
     network_conditions: NetworkConditions | None = None,
     storage_quota: StorageQuota | None = None,
+    tombstone_config: TombstoneConfig | None = None,
 ) -> SimulationResult:
     """Run Alice -> Relay -> Bob with no direct Alice/Bob encounter."""
 
@@ -54,4 +56,5 @@ def run_three_node_chain(
         policy,
         network_conditions=network_conditions,
         storage_quota=storage_quota,
+        tombstone_config=tombstone_config,
     )

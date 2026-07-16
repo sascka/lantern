@@ -20,6 +20,10 @@ from lantern_sim.model import (
     validate_node_id,
 )
 from lantern_sim.routing import ForwardingDecision, RoutingPolicy
+from lantern_sim.tombstones import (
+    TombstoneConfig,
+    TombstoneStore,
+)
 
 MAX_SIMULATION_NODES: Final = 10_000
 MAX_SIMULATION_MESSAGES: Final = 100_000
@@ -42,6 +46,12 @@ class AttemptOutcome(str, Enum):
     LOST = "lost"
     DUPLICATE_IGNORED = "duplicate_ignored"
     QUOTA_REJECTED = "quota_rejected"
+    TOMBSTONE_REJECTED = "tombstone_rejected"
+
+
+class TombstoneEventReason(str, Enum):
+    EXPIRED = "expired"
+    CAPACITY_EVICTED = "capacity_evicted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,12 +110,28 @@ class StorageRejection:
 
 
 @dataclass(frozen=True, slots=True)
+class TombstoneRejection:
+    at: int
+    node_id: str
+    message_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class TombstoneEvent:
+    at: int
+    node_id: str
+    message_id: str
+    reason: TombstoneEventReason
+
+
+@dataclass(frozen=True, slots=True)
 class SimulationResult:
     seed: int
     policy: str
     policy_parameters: tuple[tuple[str, int], ...]
     network_conditions: NetworkConditions
     storage_quota: StorageQuota
+    tombstone_config: TombstoneConfig
     node_count: int
     message_count: int
     attempts: tuple[TransferAttempt, ...]
@@ -113,11 +139,14 @@ class SimulationResult:
     deliveries: tuple[Delivery, ...]
     removals: tuple[Removal, ...]
     storage_rejections: tuple[StorageRejection, ...]
+    tombstone_rejections: tuple[TombstoneRejection, ...]
+    tombstone_events: tuple[TombstoneEvent, ...]
     blocked_transfers: tuple[BlockedTransfer, ...]
     peak_stored_messages: int
     peak_stored_bytes: int
     peak_node_stored_messages: int
     peak_node_stored_bytes: int
+    peak_node_tombstones: int
 
     @property
     def delivered_count(self) -> int:
@@ -165,6 +194,10 @@ class SimulationResult:
     @property
     def quota_rejection_count(self) -> int:
         return len(self.storage_rejections)
+
+    @property
+    def tombstone_rejection_count(self) -> int:
+        return len(self.tombstone_rejections)
 
     @property
     def average_delivery_delay(self) -> float | None:
@@ -220,6 +253,7 @@ class SimulationResult:
             "peak_stored_messages": self.peak_stored_messages,
             "peak_node_stored_bytes": self.peak_node_stored_bytes,
             "peak_node_stored_messages": self.peak_node_stored_messages,
+            "peak_node_tombstones": self.peak_node_tombstones,
             "policy": self.policy,
             "policy_parameters": dict(self.policy_parameters),
             "removal_count": len(self.removals),
@@ -243,6 +277,26 @@ class SimulationResult:
                     "reason": rejection.reason.value,
                 }
                 for rejection in self.storage_rejections
+            ],
+            "tombstone_config": self.tombstone_config.to_dict(),
+            "tombstone_event_count": len(self.tombstone_events),
+            "tombstone_events": [
+                {
+                    "at": event.at,
+                    "message_id": event.message_id,
+                    "node_id": event.node_id,
+                    "reason": event.reason.value,
+                }
+                for event in self.tombstone_events
+            ],
+            "tombstone_rejection_count": self.tombstone_rejection_count,
+            "tombstone_rejections": [
+                {
+                    "at": rejection.at,
+                    "message_id": rejection.message_id,
+                    "node_id": rejection.node_id,
+                }
+                for rejection in self.tombstone_rejections
             ],
             "transmission_count": self.transmission_count,
             "transmissions": [
@@ -341,24 +395,34 @@ class Simulation:
         policy: RoutingPolicy,
         network_conditions: NetworkConditions | None = None,
         storage_quota: StorageQuota | None = None,
+        tombstone_config: TombstoneConfig | None = None,
     ) -> SimulationResult:
         conditions = network_conditions or NetworkConditions()
         quota = storage_quota or StorageQuota()
+        tombstone_settings = tombstone_config or TombstoneConfig()
         states = {node_id: NodeState(node_id) for node_id in self._node_ids}
+        tombstones = {
+            node_id: TombstoneStore(tombstone_settings)
+            for node_id in self._node_ids
+        }
         attempts: list[TransferAttempt] = []
         transmissions: list[Transmission] = []
         removals: list[Removal] = []
         storage_rejections: list[StorageRejection] = []
+        tombstone_rejections: list[TombstoneRejection] = []
+        tombstone_events: list[TombstoneEvent] = []
         blocked_transfers: list[BlockedTransfer] = []
         delivered_at: dict[str, int] = {}
         peak_stored_messages = 0
         peak_stored_bytes = 0
         peak_node_stored_messages = 0
         peak_node_stored_bytes = 0
+        peak_node_tombstones = 0
 
         def update_peaks() -> None:
             nonlocal peak_stored_messages, peak_stored_bytes
             nonlocal peak_node_stored_messages, peak_node_stored_bytes
+            nonlocal peak_node_tombstones
             stored_messages = sum(state.message_count for state in states.values())
             stored_bytes = sum(state.stored_bytes for state in states.values())
             peak_stored_messages = max(peak_stored_messages, stored_messages)
@@ -370,6 +434,10 @@ class Simulation:
             peak_node_stored_bytes = max(
                 peak_node_stored_bytes,
                 max(state.stored_bytes for state in states.values()),
+            )
+            peak_node_tombstones = max(
+                peak_node_tombstones,
+                max(store.entry_count for store in tombstones.values()),
             )
 
         events: list[tuple[int, int, int, Message | Encounter]] = []
@@ -384,7 +452,18 @@ class Simulation:
         events.sort(key=lambda event: (event[0], event[1], event[2]))
 
         for at, event_kind, event_index, event in events:
-            self._remove_expired(at=at, states=states, removals=removals)
+            self._purge_tombstones(
+                at=at,
+                tombstones=tombstones,
+                tombstone_events=tombstone_events,
+            )
+            self._remove_expired(
+                at=at,
+                states=states,
+                removals=removals,
+                tombstones=tombstones,
+                tombstone_events=tombstone_events,
+            )
 
             if event_kind == 0:
                 if not isinstance(event, Message):
@@ -401,6 +480,8 @@ class Simulation:
                     result=store_result,
                     removals=removals,
                     storage_rejections=storage_rejections,
+                    tombstone_store=tombstones[event.source],
+                    tombstone_events=tombstone_events,
                 )
                 update_peaks()
                 continue
@@ -428,6 +509,9 @@ class Simulation:
                 storage_quota=quota,
                 removals=removals,
                 storage_rejections=storage_rejections,
+                tombstone_store=tombstones[right.node_id],
+                tombstone_rejections=tombstone_rejections,
+                tombstone_events=tombstone_events,
                 seed=self._seed,
             )
             update_peaks()
@@ -449,6 +533,9 @@ class Simulation:
                 storage_quota=quota,
                 removals=removals,
                 storage_rejections=storage_rejections,
+                tombstone_store=tombstones[left.node_id],
+                tombstone_rejections=tombstone_rejections,
+                tombstone_events=tombstone_events,
                 seed=self._seed,
             )
             update_peaks()
@@ -469,6 +556,7 @@ class Simulation:
             policy_parameters=policy.parameters,
             network_conditions=conditions,
             storage_quota=quota,
+            tombstone_config=tombstone_settings,
             node_count=len(states),
             message_count=len(self._messages),
             attempts=tuple(attempts),
@@ -476,11 +564,14 @@ class Simulation:
             deliveries=deliveries,
             removals=tuple(removals),
             storage_rejections=tuple(storage_rejections),
+            tombstone_rejections=tuple(tombstone_rejections),
+            tombstone_events=tuple(tombstone_events),
             blocked_transfers=tuple(blocked_transfers),
             peak_stored_messages=peak_stored_messages,
             peak_stored_bytes=peak_stored_bytes,
             peak_node_stored_messages=peak_node_stored_messages,
             peak_node_stored_bytes=peak_node_stored_bytes,
+            peak_node_tombstones=peak_node_tombstones,
         )
 
     @staticmethod
@@ -492,6 +583,8 @@ class Simulation:
         result: StoreResult,
         removals: list[Removal],
         storage_rejections: list[StorageRejection],
+        tombstone_store: TombstoneStore,
+        tombstone_events: list[TombstoneEvent],
     ) -> None:
         for evicted in result.evicted:
             removals.append(
@@ -501,6 +594,13 @@ class Simulation:
                     message_id=evicted.message.message_id,
                     reason=RemovalReason.QUOTA_EVICTED,
                 )
+            )
+            Simulation._add_tombstone(
+                at=at,
+                node_id=node_id,
+                message_id=evicted.message.message_id,
+                tombstone_store=tombstone_store,
+                tombstone_events=tombstone_events,
             )
         if result.outcome is StoreOutcome.ITEM_EXCEEDS_BYTE_QUOTA:
             storage_rejections.append(
@@ -513,11 +613,51 @@ class Simulation:
             )
 
     @staticmethod
+    def _add_tombstone(
+        *,
+        at: int,
+        node_id: str,
+        message_id: str,
+        tombstone_store: TombstoneStore,
+        tombstone_events: list[TombstoneEvent],
+    ) -> None:
+        result = tombstone_store.add(message_id, at=at)
+        for evicted in result.evicted:
+            tombstone_events.append(
+                TombstoneEvent(
+                    at=at,
+                    node_id=node_id,
+                    message_id=evicted.message_id,
+                    reason=TombstoneEventReason.CAPACITY_EVICTED,
+                )
+            )
+
+    @staticmethod
+    def _purge_tombstones(
+        *,
+        at: int,
+        tombstones: dict[str, TombstoneStore],
+        tombstone_events: list[TombstoneEvent],
+    ) -> None:
+        for node_id, store in tombstones.items():
+            for expired in store.purge_expired(at=at):
+                tombstone_events.append(
+                    TombstoneEvent(
+                        at=at,
+                        node_id=node_id,
+                        message_id=expired.message_id,
+                        reason=TombstoneEventReason.EXPIRED,
+                    )
+                )
+
+    @staticmethod
     def _remove_expired(
         *,
         at: int,
         states: dict[str, NodeState],
         removals: list[Removal],
+        tombstones: dict[str, TombstoneStore],
+        tombstone_events: list[TombstoneEvent],
     ) -> None:
         for node_id, state in states.items():
             for stored_message in state.remove_expired(at):
@@ -528,6 +668,13 @@ class Simulation:
                         message_id=stored_message.message.message_id,
                         reason=RemovalReason.TTL_EXPIRED,
                     )
+                )
+                Simulation._add_tombstone(
+                    at=at,
+                    node_id=node_id,
+                    message_id=stored_message.message.message_id,
+                    tombstone_store=tombstones[node_id],
+                    tombstone_events=tombstone_events,
                 )
 
     @staticmethod
@@ -546,6 +693,9 @@ class Simulation:
         storage_quota: StorageQuota,
         removals: list[Removal],
         storage_rejections: list[StorageRejection],
+        tombstone_store: TombstoneStore,
+        tombstone_rejections: list[TombstoneRejection],
+        tombstone_events: list[TombstoneEvent],
         seed: int,
     ) -> None:
         for decision in messages:
@@ -606,6 +756,26 @@ class Simulation:
                 )
                 continue
 
+            if tombstone_store.contains(message.message_id, at=at):
+                attempts.append(
+                    TransferAttempt(
+                        at=at,
+                        sender=sender.node_id,
+                        receiver=receiver.node_id,
+                        message_id=message.message_id,
+                        payload_size=message.payload_size,
+                        outcome=AttemptOutcome.TOMBSTONE_REJECTED,
+                    )
+                )
+                tombstone_rejections.append(
+                    TombstoneRejection(
+                        at=at,
+                        node_id=receiver.node_id,
+                        message_id=message.message_id,
+                    )
+                )
+                continue
+
             store_result = receiver.store_forwarded_with_eviction(
                 forwarded_copy, quota=storage_quota
             )
@@ -639,6 +809,8 @@ class Simulation:
                     result=store_result,
                     removals=removals,
                     storage_rejections=storage_rejections,
+                    tombstone_store=tombstone_store,
+                    tombstone_events=tombstone_events,
                 )
                 continue
 
@@ -649,6 +821,8 @@ class Simulation:
                 result=store_result,
                 removals=removals,
                 storage_rejections=storage_rejections,
+                tombstone_store=tombstone_store,
+                tombstone_events=tombstone_events,
             )
 
             attempts.append(

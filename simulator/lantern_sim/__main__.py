@@ -26,6 +26,11 @@ from lantern_sim.routing import (
     RoutingPolicy,
 )
 from lantern_sim.scenarios import DEFAULT_SEED, run_three_node_chain
+from lantern_sim.tombstones import (
+    DEFAULT_MAX_TOMBSTONES,
+    DEFAULT_TOMBSTONE_RETENTION_SECONDS,
+    TombstoneConfig,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -97,6 +102,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=MAX_STORED_BYTES_PER_NODE,
         help="maximum bytes of stored copies per simulated node",
     )
+    parser.add_argument(
+        "--max-tombstones",
+        type=int,
+        default=DEFAULT_MAX_TOMBSTONES,
+        help="maximum recent removed IDs remembered per simulated node",
+    )
+    parser.add_argument(
+        "--tombstone-retention-seconds",
+        type=int,
+        default=DEFAULT_TOMBSTONE_RETENTION_SECONDS,
+        help="how long a removed message ID remains blocked",
+    )
     return parser
 
 
@@ -118,6 +135,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_messages=args.max_stored_messages,
             max_bytes=args.max_stored_bytes,
         )
+        tombstone_config = TombstoneConfig(
+            max_entries=args.max_tombstones,
+            retention_seconds=args.tombstone_retention_seconds,
+        )
         result = run_three_node_chain(
             policies[args.policy],
             seed=args.seed,
@@ -126,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_hops=args.max_hops,
             network_conditions=network_conditions,
             storage_quota=storage_quota,
+            tombstone_config=tombstone_config,
         )
     except (SimulationValidationError, SimulationLimitError) as error:
         parser.error(str(error))

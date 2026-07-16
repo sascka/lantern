@@ -27,7 +27,15 @@ from lantern_sim.simulation import (
     Simulation,
     SimulationResult,
     StorageRejection,
+    TombstoneEvent,
+    TombstoneEventReason,
+    TombstoneRejection,
     TransferAttempt,
+)
+from lantern_sim.tombstones import (
+    TombstoneConfig,
+    TombstoneEntry,
+    TombstoneStore,
 )
 
 __all__ = [
@@ -51,5 +59,11 @@ __all__ = [
     "StoreOutcome",
     "StoreResult",
     "StoredMessage",
+    "TombstoneConfig",
+    "TombstoneEntry",
+    "TombstoneEvent",
+    "TombstoneEventReason",
+    "TombstoneRejection",
+    "TombstoneStore",
     "TransferAttempt",
 ]
