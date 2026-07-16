@@ -84,6 +84,7 @@ README.md
 VISION.md
 MVP.md
 THREAT_MODEL.md
+SECURITY.md
 LICENSES.md
 ```
 
