@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 
 [workspace]
-members = ["crates/lantern-core"]
+members = ["crates/lantern-core", "crates/lantern-storage"]
 resolver = "3"
 
 [workspace.package]
