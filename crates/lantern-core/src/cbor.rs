@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use minicbor::{Decoder, Encoder, data::Type};
+use minicbor::{Decoder, Encoder, data::Type, encode::Write};
 
 use crate::{
     CoreError, Envelope, Field, MAX_ENVELOPE_SIZE, MAX_PROTECTED_PAYLOAD_SIZE, MESSAGE_ID_LENGTH,
@@ -93,43 +93,64 @@ pub fn encode_envelope(envelope: &Envelope) -> Result<Vec<u8>, CborError> {
         .min(MAX_ENVELOPE_SIZE);
     let mut encoder = Encoder::new(Vec::with_capacity(initial_capacity));
 
-    encoder
-        .map(ENVELOPE_FIELD_COUNT)
-        .map_err(|_| CborError::EncodingFailed)?;
-    encode_key(&mut encoder, 0)?;
-    encoder
-        .u64(envelope.protocol_version())
-        .map_err(|_| CborError::EncodingFailed)?;
-    encode_key(&mut encoder, 1)?;
-    encoder
-        .bytes(envelope.message_id().as_bytes())
-        .map_err(|_| CborError::EncodingFailed)?;
-    encode_key(&mut encoder, 2)?;
-    encoder
-        .bytes(envelope.recipient_hint().as_bytes())
-        .map_err(|_| CborError::EncodingFailed)?;
-    encode_key(&mut encoder, 3)?;
-    encoder
-        .u64(u64::from(envelope.ttl_seconds().get()))
-        .map_err(|_| CborError::EncodingFailed)?;
-    encode_key(&mut encoder, 4)?;
-    encoder
-        .u64(u64::from(envelope.max_hops().get()))
-        .map_err(|_| CborError::EncodingFailed)?;
-    encode_key(&mut encoder, 5)?;
-    encoder
-        .u64(envelope.priority().as_raw())
-        .map_err(|_| CborError::EncodingFailed)?;
-    encode_key(&mut encoder, 6)?;
-    encoder
-        .bytes(envelope.protected_payload().as_bytes())
-        .map_err(|_| CborError::EncodingFailed)?;
+    encode_envelope_to(&mut encoder, envelope)?;
 
     let encoded = encoder.into_writer();
     if encoded.len() > MAX_ENVELOPE_SIZE {
         return Err(CborError::OutputTooLarge);
     }
     Ok(encoded)
+}
+
+/// Calculate the deterministic encoded size without allocating a payload copy.
+pub fn encoded_envelope_size(envelope: &Envelope) -> Result<usize, CborError> {
+    let mut encoder = Encoder::new(CountingWriter::default());
+    encode_envelope_to(&mut encoder, envelope)?;
+
+    let encoded_size = encoder.into_writer().encoded_size;
+    if encoded_size > MAX_ENVELOPE_SIZE {
+        return Err(CborError::OutputTooLarge);
+    }
+    Ok(encoded_size)
+}
+
+fn encode_envelope_to<W: Write>(
+    encoder: &mut Encoder<W>,
+    envelope: &Envelope,
+) -> Result<(), CborError> {
+    encoder
+        .map(ENVELOPE_FIELD_COUNT)
+        .map_err(|_| CborError::EncodingFailed)?;
+    encode_key(encoder, 0)?;
+    encoder
+        .u64(envelope.protocol_version())
+        .map_err(|_| CborError::EncodingFailed)?;
+    encode_key(encoder, 1)?;
+    encoder
+        .bytes(envelope.message_id().as_bytes())
+        .map_err(|_| CborError::EncodingFailed)?;
+    encode_key(encoder, 2)?;
+    encoder
+        .bytes(envelope.recipient_hint().as_bytes())
+        .map_err(|_| CborError::EncodingFailed)?;
+    encode_key(encoder, 3)?;
+    encoder
+        .u64(u64::from(envelope.ttl_seconds().get()))
+        .map_err(|_| CborError::EncodingFailed)?;
+    encode_key(encoder, 4)?;
+    encoder
+        .u64(u64::from(envelope.max_hops().get()))
+        .map_err(|_| CborError::EncodingFailed)?;
+    encode_key(encoder, 5)?;
+    encoder
+        .u64(envelope.priority().as_raw())
+        .map_err(|_| CborError::EncodingFailed)?;
+    encode_key(encoder, 6)?;
+    encoder
+        .bytes(envelope.protected_payload().as_bytes())
+        .map_err(|_| CborError::EncodingFailed)?;
+
+    Ok(())
 }
 
 /// Decode one strict deterministic Envelope from a bounded byte slice.
@@ -206,10 +227,30 @@ pub fn decode_envelope(input: &[u8]) -> Result<Envelope, CborError> {
     .map_err(Into::into)
 }
 
-fn encode_key(encoder: &mut Encoder<Vec<u8>>, key: u8) -> Result<(), CborError> {
+fn encode_key<W: Write>(encoder: &mut Encoder<W>, key: u8) -> Result<(), CborError> {
     encoder.u8(key).map_err(|_| CborError::EncodingFailed)?;
     Ok(())
 }
+
+#[derive(Default)]
+struct CountingWriter {
+    encoded_size: usize,
+}
+
+impl Write for CountingWriter {
+    type Error = CountingOverflow;
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.encoded_size = self
+            .encoded_size
+            .checked_add(bytes.len())
+            .ok_or(CountingOverflow)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CountingOverflow;
 
 fn decode_map_header(decoder: &mut Decoder<'_>) -> Result<(), CborError> {
     match decoder.datatype().map_err(|_| CborError::Malformed)? {
@@ -433,6 +474,7 @@ mod tests {
         };
 
         assert_eq!(bytes.len(), 64_565);
+        assert_eq!(encoded_envelope_size(&envelope), Ok(bytes.len()));
         assert!(bytes.len() <= MAX_ENVELOPE_SIZE);
         assert_eq!(decode_envelope(&bytes), Ok(envelope));
     }

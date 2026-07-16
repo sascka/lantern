@@ -12,13 +12,18 @@
 mod cbor;
 mod envelope;
 mod error;
+mod queue;
 mod route;
 
-pub use cbor::{CborError, CborField, decode_envelope, encode_envelope};
+pub use cbor::{CborError, CborField, decode_envelope, encode_envelope, encoded_envelope_size};
 pub use envelope::{
     Envelope, MaxHops, MessageId, Priority, ProtectedPayload, RecipientHint, TtlSeconds,
 };
 pub use error::{CoreError, Field};
+pub use queue::{
+    DeduplicationStatus, EnqueueOutcome, EnqueueResult, EnvelopeQueue, QueueEffects, QueueEntry,
+    QueueError, QueueField, QueueLimits, TombstoneEntry,
+};
 pub use route::{ContainerState, LocalRouteRecord};
 
 /// Only protocol version accepted by the v0.1 domain model.
@@ -45,3 +50,11 @@ pub const MAX_PROTECTED_PAYLOAD_SIZE: usize = 63 * 1024;
 pub const MAX_ENVELOPE_SIZE: usize = 64 * 1024;
 /// Initial Binary Spray-and-Wait copy budget selected in Stage 1.
 pub const INITIAL_COPY_BUDGET: u8 = 32;
+/// Maximum number of Envelopes in the default foreign-container queue.
+pub const MAX_QUEUE_ENTRIES: usize = 1_000;
+/// Maximum deterministic CBOR bytes in the default foreign-container queue.
+pub const MAX_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum number of recently removed identifiers retained for deduplication.
+pub const MAX_TOMBSTONES: usize = 2_000;
+/// Maximum local tombstone retention: seven days.
+pub const MAX_TOMBSTONE_RETENTION_SECONDS: u64 = MAX_TTL_SECONDS;

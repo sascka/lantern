@@ -9,7 +9,7 @@ use crate::{
 };
 
 /// A random fixed-size identifier supplied by a future cryptographic boundary.
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MessageId([u8; MESSAGE_ID_LENGTH]);
 
 impl MessageId {
