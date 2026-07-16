@@ -652,3 +652,561 @@ impl fmt::Debug for EnvelopeQueue {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MAX_TTL_SECONDS, NORMAL_PRIORITY, PROTOCOL_VERSION, encode_envelope};
+
+    fn message_id(number: u64) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[8..].copy_from_slice(&number.to_be_bytes());
+        bytes
+    }
+
+    fn test_envelope(number: u64, payload_size: usize, ttl_seconds: u64) -> Envelope {
+        let result = Envelope::try_from_fields(
+            PROTOCOL_VERSION,
+            message_id(number),
+            [0x22; 16],
+            ttl_seconds,
+            16,
+            NORMAL_PRIORITY,
+            vec![0x54; payload_size],
+        );
+        let Ok(envelope) = result else {
+            panic!("valid queue fixture was rejected");
+        };
+        envelope
+    }
+
+    fn origin_pair(
+        number: u64,
+        first_seen_at: u64,
+        payload_size: usize,
+        ttl_seconds: u64,
+    ) -> (Envelope, LocalRouteRecord) {
+        let envelope = test_envelope(number, payload_size, ttl_seconds);
+        let route = LocalRouteRecord::for_origin(&envelope, first_seen_at);
+        let Ok(route) = route else {
+            panic!("valid origin route was rejected");
+        };
+        (envelope, route)
+    }
+
+    fn small_limits(max_entries: usize, max_bytes: usize, max_tombstones: usize) -> QueueLimits {
+        let result = QueueLimits::try_new(max_entries, max_bytes, max_tombstones, 60);
+        let Ok(limits) = result else {
+            panic!("valid queue limits were rejected");
+        };
+        limits
+    }
+
+    fn enqueue_fixture(
+        queue: &mut EnvelopeQueue,
+        number: u64,
+        first_seen_at: u64,
+        payload_size: usize,
+    ) -> EnqueueResult {
+        let (envelope, route) = origin_pair(number, first_seen_at, payload_size, 300);
+        let result = queue.enqueue(envelope, route, first_seen_at);
+        let Ok(result) = result else {
+            panic!("valid queue fixture was rejected");
+        };
+        result
+    }
+
+    #[test]
+    fn default_and_custom_limits_are_bounded() {
+        let defaults = QueueLimits::default();
+        assert_eq!(defaults.max_entries(), MAX_QUEUE_ENTRIES);
+        assert_eq!(defaults.max_bytes(), MAX_QUEUE_BYTES);
+        assert_eq!(defaults.max_tombstones(), MAX_TOMBSTONES);
+        assert_eq!(
+            defaults.tombstone_retention_seconds(),
+            MAX_TOMBSTONE_RETENTION_SECONDS
+        );
+
+        assert_eq!(
+            QueueLimits::try_new(0, 1, 1, 60),
+            Err(QueueError::InvalidLimit {
+                field: QueueField::MaxEntries,
+            })
+        );
+        assert_eq!(
+            QueueLimits::try_new(MAX_QUEUE_ENTRIES + 1, 1, 1, 60),
+            Err(QueueError::InvalidLimit {
+                field: QueueField::MaxEntries,
+            })
+        );
+        assert_eq!(
+            QueueLimits::try_new(1, 0, 1, 60),
+            Err(QueueError::InvalidLimit {
+                field: QueueField::MaxBytes,
+            })
+        );
+        assert_eq!(
+            QueueLimits::try_new(1, MAX_QUEUE_BYTES + 1, 1, 60),
+            Err(QueueError::InvalidLimit {
+                field: QueueField::MaxBytes,
+            })
+        );
+        assert_eq!(
+            QueueLimits::try_new(1, 1, 0, 60),
+            Err(QueueError::InvalidLimit {
+                field: QueueField::MaxTombstones,
+            })
+        );
+        assert_eq!(
+            QueueLimits::try_new(1, 1, MAX_TOMBSTONES + 1, 60),
+            Err(QueueError::InvalidLimit {
+                field: QueueField::MaxTombstones,
+            })
+        );
+        assert_eq!(
+            QueueLimits::try_new(1, 1, 1, MIN_TTL_SECONDS - 1),
+            Err(QueueError::InvalidLimit {
+                field: QueueField::TombstoneRetention,
+            })
+        );
+        assert_eq!(
+            QueueLimits::try_new(1, 1, 1, MAX_TOMBSTONE_RETENTION_SECONDS + 1),
+            Err(QueueError::InvalidLimit {
+                field: QueueField::TombstoneRetention,
+            })
+        );
+    }
+
+    #[test]
+    fn default_entry_limit_holds_at_exact_protocol_boundary() {
+        let mut queue = EnvelopeQueue::default();
+        for number in 0..MAX_QUEUE_ENTRIES as u64 {
+            let (envelope, route) = origin_pair(number, 0, 1, MAX_TTL_SECONDS);
+            let result = queue.enqueue(envelope, route, 0);
+            let Ok(result) = result else {
+                panic!("valid default-boundary Envelope was rejected");
+            };
+            assert_eq!(result.outcome(), EnqueueOutcome::Stored);
+        }
+        assert_eq!(queue.len(), MAX_QUEUE_ENTRIES);
+
+        let (incoming, incoming_route) =
+            origin_pair(MAX_QUEUE_ENTRIES as u64, 1, 1, MAX_TTL_SECONDS);
+        let result = queue.enqueue(incoming, incoming_route, 1);
+        let Ok(result) = result else {
+            panic!("default queue could not apply FIFO at its boundary");
+        };
+
+        assert_eq!(result.outcome(), EnqueueOutcome::Stored);
+        assert_eq!(result.effects().removed_entries().len(), 1);
+        assert_eq!(queue.len(), MAX_QUEUE_ENTRIES);
+        assert_eq!(
+            result.effects().removed_entries()[0]
+                .envelope()
+                .message_id(),
+            MessageId::from_bytes(message_id(0))
+        );
+    }
+
+    #[test]
+    fn default_tombstone_limit_holds_at_exact_protocol_boundary() {
+        let mut queue = EnvelopeQueue::default();
+
+        for number in 0..=MAX_TOMBSTONES as u64 {
+            let (envelope, route) = origin_pair(number, 0, 1, MAX_TTL_SECONDS);
+            let inserted = queue.enqueue(envelope, route, 0);
+            let Ok(inserted) = inserted else {
+                panic!("valid tombstone-boundary Envelope was rejected");
+            };
+            assert_eq!(inserted.outcome(), EnqueueOutcome::Stored);
+            let removed = queue.remove_opened(MessageId::from_bytes(message_id(number)), 0);
+            let Ok(removed) = removed else {
+                panic!("valid tombstone-boundary removal failed");
+            };
+            if number == MAX_TOMBSTONES as u64 {
+                assert_eq!(removed.evicted_tombstones().len(), 1);
+                assert_eq!(
+                    removed.evicted_tombstones()[0].message_id(),
+                    MessageId::from_bytes(message_id(0))
+                );
+            }
+        }
+
+        assert_eq!(queue.tombstone_count(), MAX_TOMBSTONES);
+        assert_eq!(
+            queue.deduplication_status(MessageId::from_bytes(message_id(0)), 0),
+            DeduplicationStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn stores_full_cbor_size_and_returns_entry_by_identifier() {
+        let mut queue = EnvelopeQueue::default();
+        let (envelope, route) = origin_pair(1, 100, 12, 300);
+        let expected_bytes = encode_envelope(&envelope);
+        let Ok(expected_bytes) = expected_bytes else {
+            panic!("valid Envelope could not be encoded");
+        };
+        let identifier = envelope.message_id();
+
+        let result = queue.enqueue(envelope, route, 100);
+        let Ok(result) = result else {
+            panic!("valid Envelope was not stored");
+        };
+
+        assert_eq!(result.outcome(), EnqueueOutcome::Stored);
+        assert!(result.effects().is_empty());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.stored_bytes(), expected_bytes.len());
+        assert_eq!(
+            queue.get(identifier).map(QueueEntry::encoded_size),
+            Some(expected_bytes.len())
+        );
+        assert_eq!(
+            queue.deduplication_status(identifier, 100),
+            DeduplicationStatus::Active
+        );
+    }
+
+    #[test]
+    fn active_duplicate_never_replaces_or_evicts_existing_entry() {
+        let mut queue = EnvelopeQueue::new(small_limits(1, 1_000, 2));
+        let first = enqueue_fixture(&mut queue, 1, 10, 1);
+        assert_eq!(first.outcome(), EnqueueOutcome::Stored);
+        let original_bytes = queue.stored_bytes();
+
+        let (conflicting, route) = origin_pair(1, 20, 20, 300);
+        let result = queue.enqueue(conflicting, route, 20);
+        let Ok(result) = result else {
+            panic!("duplicate check failed");
+        };
+
+        assert_eq!(result.outcome(), EnqueueOutcome::DuplicateActive);
+        assert!(result.effects().removed_entries().is_empty());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.stored_bytes(), original_bytes);
+        assert_eq!(
+            queue
+                .get(MessageId::from_bytes(message_id(1)))
+                .map(|entry| entry.envelope().protected_payload().len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn opened_entry_becomes_tombstone_until_expiration_boundary() {
+        let mut queue = EnvelopeQueue::new(small_limits(2, 1_000, 2));
+        enqueue_fixture(&mut queue, 1, 10, 1);
+        let identifier = MessageId::from_bytes(message_id(1));
+
+        let removed = queue.remove_opened(identifier, 20);
+        let Ok(removed) = removed else {
+            panic!("stored entry could not be opened");
+        };
+        assert_eq!(removed.removed_entries().len(), 1);
+        assert_eq!(
+            removed.removed_entries()[0].route().state(),
+            ContainerState::Opened
+        );
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.tombstone_count(), 1);
+        assert_eq!(
+            queue.deduplication_status(identifier, 79),
+            DeduplicationStatus::Tombstone
+        );
+
+        let (duplicate, duplicate_route) = origin_pair(1, 79, 1, 300);
+        let duplicate_result = queue.enqueue(duplicate, duplicate_route, 79);
+        let Ok(duplicate_result) = duplicate_result else {
+            panic!("tombstone lookup failed");
+        };
+        assert_eq!(
+            duplicate_result.outcome(),
+            EnqueueOutcome::DuplicateTombstone
+        );
+
+        let (after_expiry, after_expiry_route) = origin_pair(1, 80, 1, 300);
+        let after_expiry_result = queue.enqueue(after_expiry, after_expiry_route, 80);
+        let Ok(after_expiry_result) = after_expiry_result else {
+            panic!("expired tombstone blocked a valid entry");
+        };
+        assert_eq!(after_expiry_result.outcome(), EnqueueOutcome::Stored);
+        assert_eq!(after_expiry_result.effects().expired_tombstones().len(), 1);
+        assert_eq!(queue.tombstone_count(), 0);
+    }
+
+    #[test]
+    fn count_quota_evicts_oldest_entry_with_stable_tiebreaker() {
+        let mut queue = EnvelopeQueue::new(small_limits(2, 2_000, 4));
+        enqueue_fixture(&mut queue, 2, 10, 1);
+        enqueue_fixture(&mut queue, 1, 10, 1);
+
+        let result = enqueue_fixture(&mut queue, 3, 20, 1);
+
+        assert_eq!(result.outcome(), EnqueueOutcome::Stored);
+        assert_eq!(result.effects().removed_entries().len(), 1);
+        let evicted = &result.effects().removed_entries()[0];
+        assert_eq!(
+            evicted.envelope().message_id(),
+            MessageId::from_bytes(message_id(1))
+        );
+        assert_eq!(evicted.route().state(), ContainerState::Evicted);
+        assert_eq!(queue.len(), 2);
+        assert!(queue.get(MessageId::from_bytes(message_id(2))).is_some());
+        assert!(queue.get(MessageId::from_bytes(message_id(3))).is_some());
+        assert_eq!(
+            queue.deduplication_status(MessageId::from_bytes(message_id(1)), 20),
+            DeduplicationStatus::Tombstone
+        );
+    }
+
+    #[test]
+    fn byte_quota_can_evict_multiple_entries_before_one_insert() {
+        let small_size = encoded_envelope_size(&test_envelope(1, 10, 300));
+        let incoming_size = encoded_envelope_size(&test_envelope(3, 50, 300));
+        let (Ok(small_size), Ok(incoming_size)) = (small_size, incoming_size) else {
+            panic!("valid Envelope size could not be measured");
+        };
+        let limits = small_limits(10, incoming_size + small_size - 1, 10);
+        let mut queue = EnvelopeQueue::new(limits);
+        enqueue_fixture(&mut queue, 1, 10, 10);
+        enqueue_fixture(&mut queue, 2, 20, 10);
+
+        let result = enqueue_fixture(&mut queue, 3, 30, 50);
+
+        assert_eq!(result.outcome(), EnqueueOutcome::Stored);
+        assert_eq!(result.effects().removed_entries().len(), 2);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.stored_bytes(), incoming_size);
+        assert!(queue.stored_bytes() <= limits.max_bytes());
+    }
+
+    #[test]
+    fn item_larger_than_byte_quota_is_rejected_without_queue_eviction() {
+        let existing_size = encoded_envelope_size(&test_envelope(1, 1, 300));
+        let incoming_size = encoded_envelope_size(&test_envelope(2, 20, 300));
+        let (Ok(existing_size), Ok(incoming_size)) = (existing_size, incoming_size) else {
+            panic!("valid Envelope size could not be measured");
+        };
+        assert!(incoming_size > existing_size);
+        let mut queue = EnvelopeQueue::new(small_limits(2, existing_size, 2));
+        enqueue_fixture(&mut queue, 1, 10, 1);
+
+        let result = enqueue_fixture(&mut queue, 2, 20, 20);
+
+        assert_eq!(result.outcome(), EnqueueOutcome::ItemExceedsByteQuota);
+        assert!(result.effects().removed_entries().is_empty());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.stored_bytes(), existing_size);
+        assert!(queue.get(MessageId::from_bytes(message_id(1))).is_some());
+    }
+
+    #[test]
+    fn tombstone_capacity_evicts_oldest_with_stable_tiebreaker() {
+        let mut queue = EnvelopeQueue::new(small_limits(3, 3_000, 2));
+        enqueue_fixture(&mut queue, 2, 1, 1);
+        enqueue_fixture(&mut queue, 1, 1, 1);
+        enqueue_fixture(&mut queue, 3, 1, 1);
+
+        let second = queue.remove_opened(MessageId::from_bytes(message_id(2)), 10);
+        let first = queue.remove_opened(MessageId::from_bytes(message_id(1)), 10);
+        let third = queue.remove_opened(MessageId::from_bytes(message_id(3)), 20);
+        let (Ok(second), Ok(first), Ok(third)) = (second, first, third) else {
+            panic!("stored entries could not be removed");
+        };
+
+        assert!(second.evicted_tombstones().is_empty());
+        assert!(first.evicted_tombstones().is_empty());
+        assert_eq!(third.evicted_tombstones().len(), 1);
+        assert_eq!(
+            third.evicted_tombstones()[0].message_id(),
+            MessageId::from_bytes(message_id(1))
+        );
+        assert_eq!(queue.tombstone_count(), 2);
+        assert_eq!(
+            queue.deduplication_status(MessageId::from_bytes(message_id(1)), 20),
+            DeduplicationStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn due_entries_expire_and_incoming_expired_entry_is_not_stored() {
+        let mut queue = EnvelopeQueue::new(small_limits(3, 3_000, 3));
+        let (envelope, route) = origin_pair(1, 10, 1, 60);
+        let stored = queue.enqueue(envelope, route, 10);
+        assert!(stored.is_ok());
+
+        let before = queue.expire_due(69);
+        let Ok(before) = before else {
+            panic!("pre-deadline maintenance failed");
+        };
+        assert!(before.removed_entries().is_empty());
+
+        let at_boundary = queue.expire_due(70);
+        let Ok(at_boundary) = at_boundary else {
+            panic!("deadline maintenance failed");
+        };
+        assert_eq!(at_boundary.removed_entries().len(), 1);
+        assert_eq!(
+            at_boundary.removed_entries()[0].route().state(),
+            ContainerState::Expired
+        );
+        assert_eq!(queue.len(), 0);
+
+        let (expired, expired_route) = origin_pair(2, 10, 1, 60);
+        let result = queue.enqueue(expired, expired_route, 70);
+        let Ok(result) = result else {
+            panic!("expired incoming entry caused an error");
+        };
+        assert_eq!(result.outcome(), EnqueueOutcome::Expired);
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.tombstone_count(), 2);
+    }
+
+    #[test]
+    fn enqueue_runs_expiration_before_applying_quota() {
+        let mut queue = EnvelopeQueue::new(small_limits(1, 1_000, 3));
+        let (old, old_route) = origin_pair(1, 0, 1, 60);
+        let old_result = queue.enqueue(old, old_route, 0);
+        assert!(old_result.is_ok());
+        let (new, new_route) = origin_pair(2, 60, 1, 60);
+
+        let result = queue.enqueue(new, new_route, 60);
+        let Ok(result) = result else {
+            panic!("valid replacement after expiration was rejected");
+        };
+
+        assert_eq!(result.outcome(), EnqueueOutcome::Stored);
+        assert_eq!(result.effects().removed_entries().len(), 1);
+        assert_eq!(
+            result.effects().removed_entries()[0].route().state(),
+            ContainerState::Expired
+        );
+        assert!(queue.get(MessageId::from_bytes(message_id(2))).is_some());
+    }
+
+    #[test]
+    fn mismatched_and_terminal_routes_are_rejected_without_mutation() {
+        let mut queue = EnvelopeQueue::default();
+        let envelope = test_envelope(1, 1, 300);
+        let other = test_envelope(2, 1, 300);
+        let other_route = LocalRouteRecord::for_origin(&other, 10);
+        let Ok(other_route) = other_route else {
+            panic!("valid route fixture was rejected");
+        };
+        assert_eq!(
+            queue.enqueue(envelope, other_route, 10),
+            Err(QueueError::RouteMessageIdMismatch)
+        );
+
+        let (envelope, mut route) = origin_pair(1, 10, 1, 300);
+        assert_eq!(route.transition_to(ContainerState::Expired), Ok(()));
+        assert_eq!(
+            queue.enqueue(envelope, route, 10),
+            Err(QueueError::RouteNotStored)
+        );
+        assert!(queue.is_empty());
+        assert_eq!(queue.tombstone_count(), 0);
+    }
+
+    #[test]
+    fn tombstone_deadline_overflow_leaves_active_queue_unchanged() {
+        let mut queue = EnvelopeQueue::new(small_limits(2, 1_000, 2));
+        enqueue_fixture(&mut queue, 1, 0, 1);
+        let stored_bytes = queue.stored_bytes();
+
+        assert_eq!(
+            queue.remove_opened(MessageId::from_bytes(message_id(1)), u64::MAX),
+            Err(QueueError::ArithmeticOverflow {
+                field: QueueField::TombstoneDeadline,
+            })
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.stored_bytes(), stored_bytes);
+        assert_eq!(queue.tombstone_count(), 0);
+    }
+
+    #[test]
+    fn deterministic_varied_sequence_preserves_all_hard_limits() {
+        let limits = small_limits(7, 700, 13);
+        let mut queue = EnvelopeQueue::new(limits);
+        let mut state = 0x4c41_4e54_4552_4e03_u64;
+
+        for step in 0..500_u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let payload_size = usize::from(state.to_le_bytes()[0] % 70) + 1;
+            let (envelope, route) = origin_pair(step + 1, step, payload_size, 300);
+            let result = queue.enqueue(envelope, route, step);
+            assert!(result.is_ok());
+
+            if step % 11 == 0 {
+                let first_id = queue
+                    .entries()
+                    .next()
+                    .map(|entry| entry.envelope().message_id());
+                if let Some(identifier) = first_id {
+                    let removed = queue.remove_opened(identifier, step);
+                    assert!(removed.is_ok());
+                }
+            }
+
+            let measured_bytes: usize = queue.entries().map(QueueEntry::encoded_size).sum();
+            assert!(queue.len() <= limits.max_entries());
+            assert!(queue.stored_bytes() <= limits.max_bytes());
+            assert!(queue.tombstone_count() <= limits.max_tombstones());
+            assert_eq!(queue.stored_bytes(), measured_bytes);
+            assert!(
+                queue
+                    .entries()
+                    .all(|entry| entry.route().state() == ContainerState::Stored)
+            );
+        }
+    }
+
+    #[test]
+    fn debug_and_errors_do_not_disclose_payload_identifiers_or_exact_times() {
+        let secret = b"OBVIOUS-QUEUE-SECRET-MARKER";
+        let envelope = Envelope::try_from_fields(
+            PROTOCOL_VERSION,
+            [0x7a; 16],
+            [0x6b; 16],
+            MAX_TTL_SECONDS,
+            16,
+            NORMAL_PRIORITY,
+            secret.to_vec(),
+        );
+        let Ok(envelope) = envelope else {
+            panic!("valid debug fixture was rejected");
+        };
+        let route = LocalRouteRecord::for_origin(&envelope, 123_456_789);
+        let Ok(route) = route else {
+            panic!("valid route fixture was rejected");
+        };
+        let mut queue = EnvelopeQueue::default();
+        let result = queue.enqueue(envelope, route, 123_456_789);
+        assert!(result.is_ok());
+        let entry = queue.entries().next();
+        let Some(entry) = entry else {
+            panic!("stored debug fixture disappeared");
+        };
+
+        let output = format!("{queue:?} {entry:?}");
+        assert!(!output.contains("OBVIOUS-QUEUE-SECRET-MARKER"));
+        assert!(!output.contains("122, 122"));
+        assert!(!output.contains("107, 107"));
+        assert!(!output.contains("123456789"));
+
+        let removed = queue.remove_opened(entry.envelope().message_id(), 123_456_790);
+        let Ok(removed) = removed else {
+            panic!("debug fixture could not be removed");
+        };
+        let tombstone = queue.tombstones().next();
+        let Some(tombstone) = tombstone else {
+            panic!("expected tombstone was not recorded");
+        };
+        let output = format!("{removed:?} {tombstone:?}");
+        assert!(!output.contains("123456790"));
+        assert!(!output.contains("122, 122"));
+    }
+}
