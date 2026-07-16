@@ -156,8 +156,18 @@ SPDX-License-Identifier: CC-BY-SA-4.0
 - CC BY 4.0: <https://creativecommons.org/licenses/by/4.0/legalcode>
 - CC BY-SA 4.0: <https://creativecommons.org/licenses/by-sa/4.0/legalcode>
 
-Перед первым программным релизом полные неизменённые тексты нужных лицензий
-должны находиться в каталоге `LICENSES/`.
+Полные неизменённые тексты сохранены в каталоге `LICENSES/`. Копии получены из
+официальных источников 16 июля 2026 года.
+
+| Файл | SHA-256 |
+| --- | --- |
+| `LICENSES/AGPL-3.0-or-later.txt` | `0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0` |
+| `LICENSES/MPL-2.0.txt` | `fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85` |
+| `LICENSES/CC-BY-4.0.txt` | `9ba9550ad48438d0836ddab3da480b3b69ffa0aac7b7878b5a0039e7ab429411` |
+| `LICENSES/CC-BY-SA-4.0.txt` | `28a9529c7d0bb4dc51f4bf5c116a3d16ef247a052f7591466768ddf563fd1cf5` |
+
+Хеши позволяют проверить, что юридические тексты не были случайно изменены при
+редактировании остальных документов.
 
 ## Ограничения решения
 
