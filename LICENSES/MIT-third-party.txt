@@ -9,6 +9,16 @@ Copyright (c) 2018 The Servo Project Developers
 Copyright (c) 2014 Alex Crichton
 Copyright (c) 2015 Nicholas Allegra (comex).
 Copyright (c) 2017 Jim McGrath
+Copyright (c) 2016 FullContact, Inc
+Copyright (c) 2018 Josh Stone
+Copyright (c) 2018-2025 The rust-random Project Developers
+Copyright (c) The Rust Project Developers
+Copyright (c) 2019 The CryptoCorrosion Contributors
+Copyright 2018 Developers of the Rand project
+Copyright 2023 The Fuchsia Authors
+Copyright (C) 2017-2023 Red Hat, Inc.
+Copyright (C) 2019-2023 Microsoft Corporation
+Copyright (C) 2022-2023 David Rheinsberg
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

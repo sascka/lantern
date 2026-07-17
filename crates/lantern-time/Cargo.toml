@@ -16,3 +16,4 @@ workspace = true
 [dev-dependencies]
 lantern-core = { path = "../lantern-core" }
 lantern-diagnostics = { path = "../lantern-diagnostics" }
+proptest.workspace = true

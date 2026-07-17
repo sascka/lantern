@@ -46,7 +46,7 @@ pub const NORMAL_PRIORITY: u64 = 0;
 pub const MIN_PROTECTED_PAYLOAD_SIZE: usize = 1;
 /// Largest protected payload allowed by the logical v0.1 schema.
 pub const MAX_PROTECTED_PAYLOAD_SIZE: usize = 63 * 1024;
-/// Largest serialized Envelope accepted by a future decoder.
+/// Largest serialized Envelope accepted by the strict decoder.
 pub const MAX_ENVELOPE_SIZE: usize = 64 * 1024;
 /// Initial Binary Spray-and-Wait copy budget selected in Stage 1.
 pub const INITIAL_COPY_BUDGET: u8 = 32;

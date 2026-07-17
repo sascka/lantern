@@ -4,7 +4,7 @@ use core::fmt;
 
 use crate::{FrameReceive, FrameTransport, MAX_FRAME_BYTES, SessionLimits, TransportFailureKind};
 
-/// Exact bounded counters for policy and coarse diagnostic conversion.
+/// Bounded counters used by session policy and diagnostics.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct SessionUsage {
     frames: u32,
@@ -125,7 +125,7 @@ impl<T> BoundedSession<T> {
 }
 
 impl<T: FrameTransport> BoundedSession<T> {
-    /// Receives one complete frame into a caller-owned fixed-size buffer.
+    /// Receives one complete frame into a reusable fixed-size buffer.
     ///
     /// The buffer must be at least `MAX_FRAME_BYTES`. Only a bounded prefix is
     /// exposed to the adapter. `Ok(None)` means a normal connection close.

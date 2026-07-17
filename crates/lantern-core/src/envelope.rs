@@ -8,7 +8,7 @@ use crate::{
     RECIPIENT_HINT_LENGTH,
 };
 
-/// A random fixed-size identifier supplied by a future cryptographic boundary.
+/// A random fixed-size identifier supplied by the cryptographic layer.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MessageId([u8; MESSAGE_ID_LENGTH]);
 
@@ -31,7 +31,7 @@ impl fmt::Debug for MessageId {
     }
 }
 
-/// An opaque fixed-size routing hint created by a future E2EE implementation.
+/// An opaque fixed-size routing hint created by the E2EE layer.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct RecipientHint([u8; RECIPIENT_HINT_LENGTH]);
 

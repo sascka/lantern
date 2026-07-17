@@ -16,7 +16,7 @@ pub use adapter::{FrameReceive, FrameTransport, TransportFailureKind};
 pub use limits::{LimitsError, SessionLimits};
 pub use session::{BoundedSession, SessionError, SessionUsage};
 
-/// Largest opaque frame accepted at the common transport boundary.
+/// Maximum size of one opaque transport frame.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Largest number of frames allowed in one direction during one session.
 pub const MAX_SESSION_FRAMES: u32 = 1_024;

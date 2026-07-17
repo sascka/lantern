@@ -14,3 +14,6 @@ workspace = true
 
 [dependencies]
 minicbor = { version = "=2.2.2", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+proptest.workspace = true
