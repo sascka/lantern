@@ -20,11 +20,11 @@ Lantern будет использовать несколько лицензий 
 | спецификация протокола | Creative Commons Attribution 4.0 | `CC-BY-4.0` |
 | остальные документы | Creative Commons Attribution-ShareAlike 4.0 | `CC-BY-SA-4.0` |
 
-В репозитории есть документы, исследовательский Python-симулятор и четыре
-библиотечных crate: `lantern-core`, `lantern-diagnostics`, `lantern-storage` и
-`lantern-time`. Для них лицензии указаны через SPDX-комментарии в начале файлов.
-Лицензия будущих приложений начнёт действовать, когда появятся соответствующие
-файлы с лицензионными уведомлениями.
+В репозитории есть документы, исследовательский Python-симулятор и пять
+библиотечных crate: `lantern-core`, `lantern-diagnostics`, `lantern-storage`,
+`lantern-time` и `lantern-transport`. Для них лицензии указаны через
+SPDX-комментарии в начале файлов. Лицензия будущих приложений начнёт
+действовать, когда появятся соответствующие файлы с лицензионными уведомлениями.
 
 Прямые сторонние Rust-зависимости workspace:
 
@@ -44,8 +44,8 @@ Lantern будет использовать несколько лицензий 
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). SQLite находится в public
 domain согласно официальному уведомлению проекта.
 
-`lantern-diagnostics` и `lantern-time` используют только стандартную библиотеку
-Rust и не добавляют сторонних пакетов в `Cargo.lock`.
+`lantern-diagnostics`, `lantern-time` и `lantern-transport` используют только
+стандартную библиотеку Rust и не добавляют сторонних пакетов в `Cargo.lock`.
 
 ## Приложения и сервер
 
