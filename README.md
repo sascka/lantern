@@ -79,6 +79,9 @@ Length-prefixed framing и общий deadline кадра записаны в
 [ADR 0023](docs/adr/0023-persist-copy-budget-before-transfer.md).
 Итоговая encounter-сессия, reconnect и лимит peer описаны в
 [ADR 0024](docs/adr/0024-bounded-bidirectional-lan-encounter.md).
+Этап 4 начат с постоянного маршрута синтетического Envelope через
+перезапущенный Relay. Трёхузловая проверка описана в
+[ADR 0025](docs/adr/0025-persistent-three-node-relay-path.md).
 Исходные данные находятся в
 [обзоре криптографии](docs/research/CRYPTOGRAPHY_REVIEW.md) и
 [результатах эксперимента](experiments/vodozemac-compat/RESULTS.md).
