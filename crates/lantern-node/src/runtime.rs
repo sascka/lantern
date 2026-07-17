@@ -17,11 +17,11 @@ use lantern_diagnostics::{
 };
 use lantern_storage::{ClockRecovery, RecoveryReport, SqliteQueueStore};
 use lantern_sync::{
-    EnvelopeSink, EnvelopeSource, MAX_OFFERED_IDS, RouteGrant, SyncSinkError, SyncSourceError,
-    SyncSummary, TransferredEnvelope, receive_batch, send_batch_from_source,
+    EnvelopeSink, EnvelopeSource, MAX_OFFERED_IDS, RouteGrant, SyncError, SyncSinkError,
+    SyncSourceError, SyncSummary, TransferredEnvelope, receive_batch, send_batch_from_source,
 };
 use lantern_time::{ClockStatus, SystemRuntimeClock};
-use lantern_transport::{BoundedSession, FrameTransport, SessionLimits};
+use lantern_transport::{BoundedSession, FrameTransport, SessionError, SessionLimits};
 
 use crate::{NodeClock, NodeError, diagnostics::NodeDiagnostics, profile_lock::ProfileLock};
 
@@ -30,6 +30,28 @@ pub enum NodeState {
     Running,
     Failed,
     Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncounterRole {
+    Initiator,
+    Responder,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EncounterSummary {
+    sent: SyncSummary,
+    received: SyncSummary,
+}
+
+impl EncounterSummary {
+    pub const fn sent(self) -> SyncSummary {
+        self.sent
+    }
+
+    pub const fn received(self) -> SyncSummary {
+        self.received
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -325,7 +347,20 @@ impl<C: NodeClock> NodeRuntime<C> {
         if let Some(error) = sink.internal_error {
             return Err(error);
         }
-        result.map_err(NodeError::from)
+        match result {
+            Ok((session, summary)) => {
+                self.record_event(
+                    EventCode::TransferCompleted,
+                    EventOutcome::Success,
+                    usize::from(summary.transferred()),
+                )?;
+                Ok((session, summary))
+            }
+            Err(error) => {
+                self.record_sync_rejection(error)?;
+                Err(error.into())
+            }
+        }
     }
 
     pub fn send_sync_batch<T: FrameTransport>(
@@ -342,7 +377,44 @@ impl<C: NodeClock> NodeRuntime<C> {
         if let Some(error) = source.internal_error {
             return Err(error);
         }
-        result.map_err(NodeError::from)
+        match result {
+            Ok((session, summary)) => {
+                self.record_event(
+                    EventCode::TransferOffered,
+                    EventOutcome::Success,
+                    usize::from(summary.offered()),
+                )?;
+                self.record_event(
+                    EventCode::TransferCompleted,
+                    EventOutcome::Success,
+                    usize::from(summary.transferred()),
+                )?;
+                Ok((session, summary))
+            }
+            Err(error) => {
+                self.record_sync_rejection(error)?;
+                Err(error.into())
+            }
+        }
+    }
+
+    pub fn run_encounter<T: FrameTransport>(
+        &mut self,
+        session: BoundedSession<T>,
+        role: EncounterRole,
+    ) -> Result<(BoundedSession<T>, EncounterSummary), NodeError> {
+        match role {
+            EncounterRole::Initiator => {
+                let (session, sent) = self.send_sync_batch(session)?;
+                let (session, received) = self.receive_sync_batch(session)?;
+                Ok((session, EncounterSummary { sent, received }))
+            }
+            EncounterRole::Responder => {
+                let (session, received) = self.receive_sync_batch(session)?;
+                let (session, sent) = self.send_sync_batch(session)?;
+                Ok((session, EncounterSummary { sent, received }))
+            }
+        }
     }
 
     pub fn stop(&mut self) -> Result<NodeMaintenance, NodeError> {
@@ -528,6 +600,10 @@ impl<C: NodeClock> NodeRuntime<C> {
         self.record_event_with_report(code, outcome, object_count, &mut maintenance)
     }
 
+    fn record_sync_rejection(&mut self, error: SyncError) -> Result<(), NodeError> {
+        self.record_event(EventCode::TransferRejected, sync_error_outcome(error), 1)
+    }
+
     fn record_event_with_report(
         &mut self,
         code: EventCode,
@@ -556,6 +632,20 @@ impl<C: NodeClock> NodeRuntime<C> {
         self.profile_lock = None;
         self.diagnostic_lock = None;
         Err(error)
+    }
+}
+
+const fn sync_error_outcome(error: SyncError) -> EventOutcome {
+    match error {
+        SyncError::UnsupportedVersion => EventOutcome::UnsupportedVersion,
+        SyncError::TooManyOfferedEnvelopes
+        | SyncError::Sink(SyncSinkError::ResourceExhausted)
+        | SyncError::Source(SyncSourceError::ResourceExhausted)
+        | SyncError::Transport(SessionError::FrameQuotaReached | SessionError::ByteQuotaReached) => {
+            EventOutcome::QuotaReached
+        }
+        SyncError::Transport(_) => EventOutcome::TransportFailure,
+        _ => EventOutcome::InvalidInput,
     }
 }
 

@@ -13,7 +13,7 @@ use std::{
 use lantern_core::{
     EnqueueOutcome, Envelope, MessageId, NORMAL_PRIORITY, PROTOCOL_VERSION, QueueLimits,
 };
-use lantern_diagnostics::{EventCode, JournalLimits};
+use lantern_diagnostics::{EventCode, EventOutcome, JournalLimits};
 use lantern_node::{NodeClock, NodeError, NodeRuntime, NodeState, ProfileLockError};
 use lantern_storage::ClockRecovery;
 use lantern_sync::{
@@ -615,7 +615,7 @@ fn sync_item_above_local_queue_quota_is_not_persisted() {
 #[test]
 fn sender_reserves_copy_budget_before_transfer_and_persists_it() {
     let database = TestDatabase::new("sender-copy-reservation");
-    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101), (2, 102), (3, 103)]);
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101), (2, 102), (3, 103), (4, 104)]);
     let runtime = NodeRuntime::start_with_clock(
         database.path(),
         queue_limits(),
@@ -663,6 +663,15 @@ fn sender_reserves_copy_budget_before_transfer_and_persists_it() {
     assert_eq!(item.route().remaining_ttl_seconds(), 298);
     assert_eq!(item.route().hops_taken(), 1);
     assert_eq!(item.route().copies_left(), 16);
+    let diagnostics = runtime
+        .diagnostics()
+        .unwrap_or_else(|_| panic!("sender diagnostics should be readable"));
+    let records = diagnostics
+        .records()
+        .map(|record| (record.code(), record.outcome(), record.object_count()))
+        .collect::<Vec<_>>();
+    assert!(records.contains(&(EventCode::TransferOffered, EventOutcome::Success, 1)));
+    assert!(records.contains(&(EventCode::TransferCompleted, EventOutcome::Success, 1)));
 
     drop(runtime);
     let (clock, _) = ScriptedClock::new(110, &[(0, 110)]);
@@ -685,7 +694,7 @@ fn sender_reserves_copy_budget_before_transfer_and_persists_it() {
 #[test]
 fn failed_transfer_burns_reserved_budget_without_failing_the_node() {
     let database = TestDatabase::new("failed-transfer-reservation");
-    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101), (2, 102), (3, 103)]);
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101), (2, 102), (3, 103), (4, 104)]);
     let runtime = NodeRuntime::start_with_clock(
         database.path(),
         queue_limits(),
@@ -720,6 +729,14 @@ fn failed_transfer_burns_reserved_budget_without_failing_the_node() {
             .map(|entry| entry.route().copies_left()),
         Some(16)
     );
+    let diagnostics = runtime
+        .diagnostics()
+        .unwrap_or_else(|_| panic!("failed transfer diagnostics should be readable"));
+    assert!(diagnostics.records().any(|record| {
+        record.code() == EventCode::TransferRejected
+            && record.outcome() == EventOutcome::TransportFailure
+            && record.object_count() == 1
+    }));
 
     drop(runtime);
     let (clock, _) = ScriptedClock::new(110, &[(0, 110)]);

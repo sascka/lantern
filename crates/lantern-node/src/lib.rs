@@ -13,4 +13,6 @@ mod runtime;
 pub use clock::NodeClock;
 pub use error::NodeError;
 pub use profile_lock::ProfileLockError;
-pub use runtime::{NodeEnqueueReport, NodeMaintenance, NodeRuntime, NodeState};
+pub use runtime::{
+    EncounterRole, EncounterSummary, NodeEnqueueReport, NodeMaintenance, NodeRuntime, NodeState,
+};
