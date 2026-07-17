@@ -73,6 +73,17 @@ name = "lantern-diagnostics"
 version = "0.1.0"
 
 [[package]]
+name = "lantern-node"
+version = "0.1.0"
+dependencies = [
+ "lantern-core",
+ "lantern-diagnostics",
+ "lantern-storage",
+ "lantern-time",
+ "lantern-transport",
+]
+
+[[package]]
 name = "lantern-storage"
 version = "0.1.0"
 dependencies = [

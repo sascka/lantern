@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MPL-2.0
+
+[package]
+name = "lantern-node"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded lifecycle orchestration for a Lantern node"
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lantern-core = { path = "../lantern-core" }
+lantern-diagnostics = { path = "../lantern-diagnostics" }
+lantern-storage = { path = "../lantern-storage" }
+lantern-time = { path = "../lantern-time" }
+lantern-transport = { path = "../lantern-transport" }

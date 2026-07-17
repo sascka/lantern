@@ -4,6 +4,7 @@
 members = [
     "crates/lantern-core",
     "crates/lantern-diagnostics",
+    "crates/lantern-node",
     "crates/lantern-storage",
     "crates/lantern-time",
     "crates/lantern-transport",

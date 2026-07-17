@@ -1,0 +1,360 @@
+// SPDX-License-Identifier: MPL-2.0
+
+use core::fmt;
+use std::path::Path;
+
+use lantern_core::{
+    ContainerState, EnqueueOutcome, Envelope, EnvelopeQueue, LocalRouteRecord, QueueEffects,
+    QueueLimits,
+};
+use lantern_diagnostics::{
+    DiagnosticEvent, DiagnosticJournal, EventCode, EventOutcome, JournalLimits, JournalMaintenance,
+    JournalView, SizeBucket,
+};
+use lantern_storage::{ClockRecovery, RecoveryReport, SqliteQueueStore};
+use lantern_time::{ClockStatus, SystemRuntimeClock};
+use lantern_transport::{BoundedSession, FrameTransport, SessionLimits};
+
+use crate::{NodeClock, NodeError};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeState {
+    Running,
+    Failed,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodeMaintenance {
+    clock_rollback_detected: bool,
+    expired_entries: usize,
+    evicted_entries: usize,
+    expired_tombstones: usize,
+    evicted_tombstones: usize,
+    expired_diagnostics: usize,
+    evicted_diagnostics: usize,
+    cleared_diagnostics: usize,
+}
+
+impl NodeMaintenance {
+    pub const fn clock_rollback_detected(self) -> bool {
+        self.clock_rollback_detected
+    }
+
+    pub const fn expired_entries(self) -> usize {
+        self.expired_entries
+    }
+
+    pub const fn evicted_entries(self) -> usize {
+        self.evicted_entries
+    }
+
+    pub const fn expired_tombstones(self) -> usize {
+        self.expired_tombstones
+    }
+
+    pub const fn evicted_tombstones(self) -> usize {
+        self.evicted_tombstones
+    }
+
+    pub const fn expired_diagnostics(self) -> usize {
+        self.expired_diagnostics
+    }
+
+    pub const fn evicted_diagnostics(self) -> usize {
+        self.evicted_diagnostics
+    }
+
+    pub const fn cleared_diagnostics(self) -> usize {
+        self.cleared_diagnostics
+    }
+
+    fn include_queue_effects(&mut self, effects: &QueueEffects) {
+        for entry in effects.removed_entries() {
+            match entry.route().state() {
+                ContainerState::Expired => self.expired_entries += 1,
+                ContainerState::Evicted => self.evicted_entries += 1,
+                _ => {}
+            }
+        }
+        self.expired_tombstones += effects.expired_tombstones().len();
+        self.evicted_tombstones += effects.evicted_tombstones().len();
+    }
+
+    fn include_journal_maintenance(&mut self, maintenance: JournalMaintenance) {
+        self.expired_diagnostics += maintenance.expired_records();
+        self.evicted_diagnostics += maintenance.evicted_records();
+        self.cleared_diagnostics += maintenance.rollback_cleared_records();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeEnqueueReport {
+    outcome: EnqueueOutcome,
+    maintenance: NodeMaintenance,
+}
+
+impl NodeEnqueueReport {
+    pub const fn outcome(self) -> EnqueueOutcome {
+        self.outcome
+    }
+
+    pub const fn maintenance(self) -> NodeMaintenance {
+        self.maintenance
+    }
+}
+
+pub struct NodeRuntime<C = SystemRuntimeClock> {
+    state: NodeState,
+    clock: C,
+    store: SqliteQueueStore,
+    queue: EnvelopeQueue,
+    diagnostics: DiagnosticJournal,
+    startup_recovery: RecoveryReport,
+    last_wall_seconds: u64,
+}
+
+impl NodeRuntime<SystemRuntimeClock> {
+    pub fn start(
+        database_path: &Path,
+        queue_limits: QueueLimits,
+        journal_limits: JournalLimits,
+    ) -> Result<Self, NodeError> {
+        let clock = SystemRuntimeClock::start()?;
+        Self::start_with_clock(database_path, queue_limits, journal_limits, clock)
+    }
+}
+
+impl<C: NodeClock> NodeRuntime<C> {
+    pub fn start_with_clock(
+        database_path: &Path,
+        queue_limits: QueueLimits,
+        journal_limits: JournalLimits,
+        mut clock: C,
+    ) -> Result<Self, NodeError> {
+        let reading = clock.read()?;
+        let mut store = SqliteQueueStore::open(database_path, queue_limits)?;
+        let recovered = store.load(reading.wall_seconds())?;
+        let startup_recovery = recovered.report();
+        let mut runtime = Self {
+            state: NodeState::Running,
+            clock,
+            store,
+            queue: recovered.into_queue(),
+            diagnostics: DiagnosticJournal::new(journal_limits),
+            startup_recovery,
+            last_wall_seconds: reading.wall_seconds(),
+        };
+
+        runtime.record_event(EventCode::NodeStarted, EventOutcome::Success, 1)?;
+        runtime.record_event(EventCode::StorageOpened, EventOutcome::Success, 1)?;
+        runtime.record_event(
+            EventCode::QueueRecovered,
+            EventOutcome::Success,
+            runtime.queue.len(),
+        )?;
+        if startup_recovery.clock_recovery() == ClockRecovery::RollbackDetected {
+            runtime.record_event(
+                EventCode::ClockRollbackDetected,
+                EventOutcome::ClockRollback,
+                startup_recovery.expired_entries(),
+            )?;
+        }
+        Ok(runtime)
+    }
+
+    pub const fn state(&self) -> NodeState {
+        self.state
+    }
+
+    pub const fn queue(&self) -> &EnvelopeQueue {
+        &self.queue
+    }
+
+    pub const fn startup_recovery(&self) -> RecoveryReport {
+        self.startup_recovery
+    }
+
+    pub fn maintain(&mut self) -> Result<NodeMaintenance, NodeError> {
+        self.observe_and_persist()
+    }
+
+    pub fn enqueue_origin(&mut self, envelope: Envelope) -> Result<NodeEnqueueReport, NodeError> {
+        let (now, mut maintenance) = self.observe_time()?;
+        let route = match LocalRouteRecord::for_origin(&envelope, now) {
+            Ok(route) => route,
+            Err(error) => return self.fail(error.into()),
+        };
+        let result = match self.queue.enqueue(envelope, route, now) {
+            Ok(result) => result,
+            Err(error) => return self.fail(error.into()),
+        };
+        let outcome = result.outcome();
+        maintenance.include_queue_effects(result.effects());
+        if let Err(error) = self.store.save(&self.queue, now) {
+            return self.fail(error.into());
+        }
+
+        let (code, event_outcome) = match outcome {
+            EnqueueOutcome::Stored => (EventCode::EnvelopeAccepted, EventOutcome::Success),
+            EnqueueOutcome::DuplicateActive | EnqueueOutcome::DuplicateTombstone => {
+                (EventCode::DuplicateIgnored, EventOutcome::Duplicate)
+            }
+            EnqueueOutcome::Expired => (EventCode::EnvelopeRejected, EventOutcome::Expired),
+            EnqueueOutcome::ItemExceedsByteQuota => {
+                (EventCode::EnvelopeRejected, EventOutcome::QuotaReached)
+            }
+        };
+        if let Err(error) = self.record_event_with_report(code, event_outcome, 1, &mut maintenance)
+        {
+            return self.fail(error);
+        }
+        Ok(NodeEnqueueReport {
+            outcome,
+            maintenance,
+        })
+    }
+
+    pub fn diagnostics(&mut self) -> Result<JournalView<'_>, NodeError> {
+        self.observe_and_persist()?;
+        Ok(self.diagnostics.view(self.last_wall_seconds))
+    }
+
+    pub fn begin_session<T: FrameTransport>(
+        &self,
+        transport: T,
+        limits: SessionLimits,
+    ) -> Result<BoundedSession<T>, NodeError> {
+        self.ensure_running()?;
+        Ok(BoundedSession::new(transport, limits))
+    }
+
+    pub fn stop(&mut self) -> Result<NodeMaintenance, NodeError> {
+        let mut maintenance = self.observe_and_persist()?;
+        if let Err(error) = self.record_event_with_report(
+            EventCode::NodeStopped,
+            EventOutcome::Success,
+            1,
+            &mut maintenance,
+        ) {
+            return self.fail(error);
+        }
+        self.state = NodeState::Stopped;
+        Ok(maintenance)
+    }
+
+    fn observe_and_persist(&mut self) -> Result<NodeMaintenance, NodeError> {
+        let (now, mut maintenance) = self.observe_time()?;
+        if let Err(error) = self.store.save(&self.queue, now) {
+            return self.fail(error.into());
+        }
+        if maintenance.clock_rollback_detected {
+            let count = maintenance.expired_entries;
+            if let Err(error) = self.record_event_with_report(
+                EventCode::ClockRollbackDetected,
+                EventOutcome::ClockRollback,
+                count,
+                &mut maintenance,
+            ) {
+                return self.fail(error);
+            }
+        }
+        if maintenance.expired_entries > 0 {
+            let count = maintenance.expired_entries;
+            if let Err(error) = self.record_event_with_report(
+                EventCode::EnvelopeExpired,
+                EventOutcome::Expired,
+                count,
+                &mut maintenance,
+            ) {
+                return self.fail(error);
+            }
+        }
+        Ok(maintenance)
+    }
+
+    fn observe_time(&mut self) -> Result<(u64, NodeMaintenance), NodeError> {
+        self.ensure_running()?;
+        let reading = match self.clock.read() {
+            Ok(reading) => reading,
+            Err(error) => return self.fail(error.into()),
+        };
+        let now = reading.wall_seconds();
+        let effects = if reading.status() == ClockStatus::WallClockRollbackDetected {
+            self.queue.expire_all(now)
+        } else {
+            self.queue.expire_due(now)
+        };
+        let effects = match effects {
+            Ok(effects) => effects,
+            Err(error) => return self.fail(error.into()),
+        };
+
+        let mut maintenance = NodeMaintenance {
+            clock_rollback_detected: reading.status().requires_conservative_cleanup(),
+            ..NodeMaintenance::default()
+        };
+        maintenance.include_queue_effects(&effects);
+        if maintenance.clock_rollback_detected {
+            maintenance.cleared_diagnostics = self.diagnostics.clear();
+        } else {
+            let journal_maintenance = self.diagnostics.maintain(now);
+            maintenance.include_journal_maintenance(journal_maintenance);
+        }
+        self.last_wall_seconds = now;
+        Ok((now, maintenance))
+    }
+
+    fn record_event(
+        &mut self,
+        code: EventCode,
+        outcome: EventOutcome,
+        object_count: usize,
+    ) -> Result<(), NodeError> {
+        let mut maintenance = NodeMaintenance::default();
+        self.record_event_with_report(code, outcome, object_count, &mut maintenance)
+    }
+
+    fn record_event_with_report(
+        &mut self,
+        code: EventCode,
+        outcome: EventOutcome,
+        object_count: usize,
+        maintenance: &mut NodeMaintenance,
+    ) -> Result<(), NodeError> {
+        let object_count = u16::try_from(object_count)
+            .map_err(|_| lantern_diagnostics::DiagnosticError::ObjectCountTooLarge)?;
+        let event = DiagnosticEvent::try_new(code, outcome, object_count, None, None)?;
+        let result = self.diagnostics.record(event, self.last_wall_seconds)?;
+        maintenance.include_journal_maintenance(result.maintenance());
+        Ok(())
+    }
+
+    fn ensure_running(&self) -> Result<(), NodeError> {
+        if self.state == NodeState::Running {
+            Ok(())
+        } else {
+            Err(NodeError::NotRunning)
+        }
+    }
+
+    fn fail<T>(&mut self, error: NodeError) -> Result<T, NodeError> {
+        self.state = NodeState::Failed;
+        Err(error)
+    }
+}
+
+impl<C> fmt::Debug for NodeRuntime<C> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let queue_size = SizeBucket::from_bytes(Some(self.queue.stored_bytes()));
+        formatter
+            .debug_struct("NodeRuntime")
+            .field("state", &self.state)
+            .field("queue_entries", &self.queue.len())
+            .field("queue_size", &queue_size)
+            .field("diagnostic_records", &self.diagnostics.len())
+            .field("startup_recovery", &self.startup_recovery)
+            .finish_non_exhaustive()
+    }
+}
+
