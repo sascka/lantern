@@ -12,7 +12,7 @@ use std::{
 
 use lantern_core::{EnqueueOutcome, Envelope, NORMAL_PRIORITY, PROTOCOL_VERSION, QueueLimits};
 use lantern_diagnostics::{EventCode, JournalLimits};
-use lantern_node::{NodeClock, NodeError, NodeRuntime, NodeState};
+use lantern_node::{NodeClock, NodeError, NodeRuntime, NodeState, ProfileLockError};
 use lantern_storage::ClockRecovery;
 use lantern_time::{ClockError, ClockReading, ClockTracker};
 use lantern_transport::{FrameReceive, FrameTransport, SessionLimits, TransportFailureKind};
@@ -41,6 +41,7 @@ impl Drop for TestDatabase {
         for suffix in ["-journal", "-wal", "-shm"] {
             let _ = fs::remove_file(format!("{}{suffix}", self.0.display()));
         }
+        let _ = fs::remove_file(format!("{}.lock", self.0.display()));
     }
 }
 
@@ -310,6 +311,16 @@ fn clock_failure_stops_further_node_operations() {
         runtime.enqueue_origin(envelope(0x66, 300)),
         Err(NodeError::NotRunning)
     );
+    let (replacement_clock, _) = ScriptedClock::new(120, &[(0, 120)]);
+    assert!(
+        NodeRuntime::start_with_clock(
+            database.path(),
+            queue_limits(),
+            JournalLimits::default(),
+            replacement_clock,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -362,4 +373,213 @@ fn debug_and_errors_do_not_reveal_path_identifier_or_exact_time() {
     assert!(!output.contains("3333333333333333"));
     assert!(output.contains("UpTo1KiB"));
     assert!(!format!("{:?}", NodeError::NotRunning).contains("private-marker"));
+}
+
+#[test]
+fn profile_lock_rejects_a_second_node_and_stop_releases_it() {
+    let database = TestDatabase::new("profile-lock");
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101)]);
+    let first = NodeRuntime::start_with_clock(
+        database.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    let Ok(mut first) = first else {
+        panic!("first node could not acquire its profile");
+    };
+
+    let (clock, reads) = ScriptedClock::new(100, &[(0, 100)]);
+    let second = NodeRuntime::start_with_clock(
+        database.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    assert!(matches!(
+        second,
+        Err(NodeError::ProfileLock(ProfileLockError::AlreadyInUse))
+    ));
+    assert_eq!(reads.get(), 0);
+
+    assert!(first.stop().is_ok());
+    let (clock, _) = ScriptedClock::new(102, &[(0, 102)]);
+    assert!(
+        NodeRuntime::start_with_clock(
+            database.path(),
+            queue_limits(),
+            JournalLimits::default(),
+            clock,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn persistent_diagnostics_survive_node_restart_when_explicitly_enabled() {
+    let database = TestDatabase::new("persistent-queue");
+    let diagnostics = TestDatabase::new("persistent-diagnostics");
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101), (2, 102)]);
+    let first = NodeRuntime::start_with_clock_and_persistent_diagnostics(
+        database.path(),
+        diagnostics.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    let Ok(mut first) = first else {
+        panic!("node could not start with persistent diagnostics");
+    };
+    assert!(first.persistent_diagnostics_enabled());
+    assert!(first.enqueue_origin(envelope(0x77, 300)).is_ok());
+    assert!(first.stop().is_ok());
+    drop(first);
+
+    let (clock, _) = ScriptedClock::new(110, &[(0, 110), (1, 111)]);
+    let second = NodeRuntime::start_with_clock_and_persistent_diagnostics(
+        database.path(),
+        diagnostics.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    let Ok(mut second) = second else {
+        panic!("node could not recover persistent diagnostics");
+    };
+    let view = second.diagnostics();
+    let Ok(view) = view else {
+        panic!("recovered persistent diagnostics could not be viewed");
+    };
+    let codes = view
+        .records()
+        .map(|record| record.code())
+        .collect::<Vec<_>>();
+    assert!(codes.contains(&EventCode::EnvelopeAccepted));
+    assert!(codes.contains(&EventCode::NodeStopped));
+}
+
+#[test]
+fn persistent_diagnostics_are_cleared_after_restart_clock_rollback() {
+    let database = TestDatabase::new("diagnostic-rollback-queue");
+    let diagnostics = TestDatabase::new("diagnostic-rollback-log");
+    let (clock, _) = ScriptedClock::new(1_000, &[(0, 1_000), (1, 1_001), (2, 1_002)]);
+    let first = NodeRuntime::start_with_clock_and_persistent_diagnostics(
+        database.path(),
+        diagnostics.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    let Ok(mut first) = first else {
+        panic!("node could not start before diagnostic rollback");
+    };
+    assert!(first.enqueue_origin(envelope(0x88, 300)).is_ok());
+    assert!(first.stop().is_ok());
+    drop(first);
+
+    let (clock, _) = ScriptedClock::new(900, &[(0, 900), (1, 901)]);
+    let recovered = NodeRuntime::start_with_clock_and_persistent_diagnostics(
+        database.path(),
+        diagnostics.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    let Ok(mut recovered) = recovered else {
+        panic!("node did not recover after diagnostic clock rollback");
+    };
+    assert!(
+        recovered
+            .startup_diagnostic_recovery()
+            .clock_rollback_detected()
+    );
+    assert!(recovered.startup_diagnostic_recovery().cleared_records() >= 5);
+    let view = recovered.diagnostics();
+    let Ok(view) = view else {
+        panic!("diagnostics could not be viewed after restart rollback");
+    };
+    let codes = view
+        .records()
+        .map(|record| record.code())
+        .collect::<Vec<_>>();
+    assert!(!codes.contains(&EventCode::EnvelopeAccepted));
+    assert!(!codes.contains(&EventCode::NodeStopped));
+    assert!(codes.contains(&EventCode::ClockRollbackDetected));
+}
+
+#[test]
+fn overlapping_queue_diagnostic_and_lock_paths_are_rejected() {
+    let database = TestDatabase::new("path-overlap");
+    let (clock, reads) = ScriptedClock::new(100, &[(0, 100)]);
+    assert!(matches!(
+        NodeRuntime::start_with_clock_and_persistent_diagnostics(
+            database.path(),
+            database.path(),
+            queue_limits(),
+            JournalLimits::default(),
+            clock,
+        ),
+        Err(NodeError::InvalidProfilePaths)
+    ));
+    assert_eq!(reads.get(), 0);
+
+    let lock_path = PathBuf::from(format!("{}.lock", database.path().display()));
+    let (clock, reads) = ScriptedClock::new(100, &[(0, 100)]);
+    assert!(matches!(
+        NodeRuntime::start_with_clock_and_persistent_diagnostics(
+            database.path(),
+            &lock_path,
+            queue_limits(),
+            JournalLimits::default(),
+            clock,
+        ),
+        Err(NodeError::InvalidProfilePaths)
+    ));
+    assert_eq!(reads.get(), 0);
+
+    let queue_journal = PathBuf::from(format!("{}-journal", database.path().display()));
+    let (clock, reads) = ScriptedClock::new(100, &[(0, 100)]);
+    assert!(matches!(
+        NodeRuntime::start_with_clock_and_persistent_diagnostics(
+            database.path(),
+            &queue_journal,
+            queue_limits(),
+            JournalLimits::default(),
+            clock,
+        ),
+        Err(NodeError::InvalidProfilePaths)
+    ));
+    assert_eq!(reads.get(), 0);
+}
+
+#[test]
+fn different_profiles_cannot_share_one_persistent_diagnostic_file() {
+    let first_database = TestDatabase::new("shared-diagnostics-first");
+    let second_database = TestDatabase::new("shared-diagnostics-second");
+    let diagnostics = TestDatabase::new("shared-diagnostics-log");
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101)]);
+    let first = NodeRuntime::start_with_clock_and_persistent_diagnostics(
+        first_database.path(),
+        diagnostics.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    let Ok(mut first) = first else {
+        panic!("first profile could not open persistent diagnostics");
+    };
+
+    let (clock, reads) = ScriptedClock::new(100, &[(0, 100)]);
+    assert!(matches!(
+        NodeRuntime::start_with_clock_and_persistent_diagnostics(
+            second_database.path(),
+            diagnostics.path(),
+            queue_limits(),
+            JournalLimits::default(),
+            clock,
+        ),
+        Err(NodeError::ProfileLock(ProfileLockError::AlreadyInUse))
+    ));
+    assert_eq!(reads.get(), 0);
+    assert!(first.stop().is_ok());
 }
