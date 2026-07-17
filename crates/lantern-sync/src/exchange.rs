@@ -5,13 +5,20 @@ use lantern_transport::{BoundedSession, FrameTransport, MAX_FRAME_BYTES};
 
 use crate::frame::encode_transfer_envelope;
 use crate::{
-    MAX_OFFERED_IDS, SyncError, SyncFrame, SyncSinkError, TransferredEnvelope, decode_sync_frame,
-    encode_sync_frame,
+    MAX_OFFERED_IDS, SyncError, SyncFrame, SyncSinkError, SyncSourceError, TransferredEnvelope,
+    decode_sync_frame, encode_sync_frame,
 };
 
 pub trait EnvelopeSink {
     fn wants(&mut self, message_id: MessageId) -> Result<bool, SyncSinkError>;
     fn accept(&mut self, item: TransferredEnvelope) -> Result<(), SyncSinkError>;
+}
+
+pub trait EnvelopeSource {
+    fn prepare_transfer(
+        &mut self,
+        message_id: MessageId,
+    ) -> Result<TransferredEnvelope, SyncSourceError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +71,40 @@ pub fn send_batch<T: FrameTransport>(
         session,
         SyncSummary {
             offered: count_u8(sorted.len())?,
+            requested: count_u8(requested.len())?,
+            transferred: count_u8(requested.len())?,
+        },
+    ))
+}
+
+pub fn send_batch_from_source<T: FrameTransport, S: EnvelopeSource>(
+    mut session: BoundedSession<T>,
+    offered: &[MessageId],
+    source: &mut S,
+) -> Result<(BoundedSession<T>, SyncSummary), SyncError> {
+    send_frame(&mut session, &SyncFrame::offer(offered.to_vec())?)?;
+
+    let request = receive_frame(&mut session)?;
+    let SyncFrame::Request(requested) = request else {
+        return Err(SyncError::UnexpectedFrame);
+    };
+    for requested_id in &requested {
+        if offered.binary_search(requested_id).is_err() {
+            return Err(SyncError::RequestNotOffered);
+        }
+        let item = source.prepare_transfer(*requested_id)?;
+        if item.message_id() != *requested_id {
+            return Err(SyncError::SourceIdentifierMismatch);
+        }
+        let encoded = encode_transfer_envelope(&item)?;
+        session.send_frame(&encoded)?;
+    }
+    send_frame(&mut session, &SyncFrame::done())?;
+
+    Ok((
+        session,
+        SyncSummary {
+            offered: count_u8(offered.len())?,
             requested: count_u8(requested.len())?,
             transferred: count_u8(requested.len())?,
         },
@@ -229,6 +270,26 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestSource {
+        items: Vec<TransferredEnvelope>,
+        prepared: Vec<MessageId>,
+    }
+
+    impl EnvelopeSource for TestSource {
+        fn prepare_transfer(
+            &mut self,
+            message_id: MessageId,
+        ) -> Result<TransferredEnvelope, SyncSourceError> {
+            self.prepared.push(message_id);
+            self.items
+                .iter()
+                .find(|item| item.message_id() == message_id)
+                .cloned()
+                .ok_or(SyncSourceError::Rejected)
+        }
+    }
+
     #[test]
     fn sender_rejects_unoffered_request_and_consumes_the_session() {
         let request = SyncFrame::request(vec![MessageId::from_bytes([0x77; 16])]);
@@ -274,6 +335,55 @@ mod tests {
         assert_eq!(sent[0], encoded(&offer));
         assert_eq!(decode_sync_frame(&sent[1]), Ok(SyncFrame::transfer(second)));
         assert_eq!(sent[2], encoded(&SyncFrame::done()));
+    }
+
+    #[test]
+    fn source_prepares_only_identifiers_requested_by_receiver() {
+        let first = transferred(0x11);
+        let second = transferred(0x22);
+        let offered = [first.message_id(), second.message_id()];
+        let request = SyncFrame::request(vec![second.message_id()])
+            .unwrap_or_else(|_| panic!("request fixture should be valid"));
+        let transport = MemoryTransport {
+            incoming: VecDeque::from([encoded(&request)]),
+            sent: Vec::new(),
+        };
+        let session = BoundedSession::new(transport, SessionLimits::default());
+        let mut source = TestSource {
+            items: vec![first, second.clone()],
+            prepared: Vec::new(),
+        };
+
+        let (session, summary) = send_batch_from_source(session, &offered, &mut source)
+            .unwrap_or_else(|_| panic!("source batch should complete"));
+
+        assert_eq!(source.prepared, [second.message_id()]);
+        assert_eq!(summary.offered(), 2);
+        assert_eq!(summary.transferred(), 1);
+        let sent = session.into_inner().sent;
+        assert_eq!(sent.len(), 3);
+        assert_eq!(decode_sync_frame(&sent[1]), Ok(SyncFrame::transfer(second)));
+    }
+
+    #[test]
+    fn source_rejection_stops_before_transfer_send() {
+        let offered = [MessageId::from_bytes([0x11; MESSAGE_ID_LENGTH])];
+        let request = SyncFrame::request(offered.to_vec())
+            .unwrap_or_else(|_| panic!("request fixture should be valid"));
+        let transport = MemoryTransport {
+            incoming: VecDeque::from([encoded(&request)]),
+            sent: Vec::new(),
+        };
+        let session = BoundedSession::new(transport, SessionLimits::default());
+        let mut source = TestSource {
+            items: vec![transferred(0x22)],
+            prepared: Vec::new(),
+        };
+
+        assert_eq!(
+            send_batch_from_source(session, &offered, &mut source).map(|_| ()),
+            Err(SyncError::Source(SyncSourceError::Rejected))
+        );
     }
 
     #[test]

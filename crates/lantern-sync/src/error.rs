@@ -26,6 +26,27 @@ impl fmt::Display for SyncSinkError {
 impl std::error::Error for SyncSinkError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncSourceError {
+    Unavailable,
+    Rejected,
+    ResourceExhausted,
+}
+
+impl fmt::Display for SyncSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("Envelope source is unavailable"),
+            Self::Rejected => formatter.write_str("Envelope source rejected the transfer"),
+            Self::ResourceExhausted => {
+                formatter.write_str("Envelope source reached a resource limit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SyncSourceError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncError {
     FrameTooSmall,
     FrameTooLarge,
@@ -42,8 +63,10 @@ pub enum SyncError {
     UnexpectedFrame,
     RequestNotOffered,
     TransferNotRequested,
+    SourceIdentifierMismatch,
     Transport(SessionError),
     Sink(SyncSinkError),
+    Source(SyncSourceError),
 }
 
 impl fmt::Display for SyncError {
@@ -76,8 +99,12 @@ impl fmt::Display for SyncError {
             Self::TransferNotRequested => {
                 formatter.write_str("Envelope transfer was not requested")
             }
+            Self::SourceIdentifierMismatch => {
+                formatter.write_str("Envelope source returned a different identifier")
+            }
             Self::Transport(_) => formatter.write_str("sync transport operation failed"),
             Self::Sink(_) => formatter.write_str("sync Envelope sink failed"),
+            Self::Source(_) => formatter.write_str("sync Envelope source failed"),
         }
     }
 }
@@ -93,5 +120,11 @@ impl From<SessionError> for SyncError {
 impl From<SyncSinkError> for SyncError {
     fn from(error: SyncSinkError) -> Self {
         Self::Sink(error)
+    }
+}
+
+impl From<SyncSourceError> for SyncError {
+    fn from(error: SyncSourceError) -> Self {
+        Self::Source(error)
     }
 }

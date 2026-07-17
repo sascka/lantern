@@ -12,8 +12,10 @@ mod exchange;
 mod frame;
 mod route;
 
-pub use error::{SyncError, SyncSinkError};
-pub use exchange::{EnvelopeSink, SyncSummary, receive_batch, send_batch};
+pub use error::{SyncError, SyncSinkError, SyncSourceError};
+pub use exchange::{
+    EnvelopeSink, EnvelopeSource, SyncSummary, receive_batch, send_batch, send_batch_from_source,
+};
 pub use frame::{
     MAX_OFFERED_IDS, MAX_TRANSFER_ENVELOPE_BYTES, SYNC_PROTOCOL_VERSION, SyncFrame,
     decode_sync_frame, encode_sync_frame,
