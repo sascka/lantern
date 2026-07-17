@@ -121,6 +121,12 @@ fn envelope(number: u8, ttl_seconds: u64) -> Envelope {
     envelope
 }
 
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 #[test]
 fn node_persists_an_origin_envelope_across_restart() {
     let database = TestDatabase::new("restart");
@@ -456,6 +462,51 @@ fn persistent_diagnostics_survive_node_restart_when_explicitly_enabled() {
         .collect::<Vec<_>>();
     assert!(codes.contains(&EventCode::EnvelopeAccepted));
     assert!(codes.contains(&EventCode::NodeStopped));
+}
+
+#[test]
+fn persistent_diagnostics_do_not_store_envelope_secrets() {
+    const PAYLOAD_MARKER: &[u8] = b"LANTERN-TEST-PRIVATE-PAYLOAD-7d2e9c4a";
+    const MESSAGE_ID: [u8; 16] = [0xa7; 16];
+    const RECIPIENT_HINT: [u8; 16] = [0xb8; 16];
+
+    let database = TestDatabase::new("private-queue-marker");
+    let diagnostics = TestDatabase::new("private-diagnostic-marker");
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101), (2, 102)]);
+    let runtime = NodeRuntime::start_with_clock_and_persistent_diagnostics(
+        database.path(),
+        diagnostics.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    let Ok(mut runtime) = runtime else {
+        panic!("node could not start for persistent diagnostic privacy test");
+    };
+    let envelope = Envelope::try_from_fields(
+        PROTOCOL_VERSION,
+        MESSAGE_ID,
+        RECIPIENT_HINT,
+        300,
+        4,
+        NORMAL_PRIORITY,
+        PAYLOAD_MARKER.to_vec(),
+    );
+    let Ok(envelope) = envelope else {
+        panic!("valid privacy-test Envelope was rejected");
+    };
+    assert!(runtime.enqueue_origin(envelope).is_ok());
+    assert!(runtime.stop().is_ok());
+    drop(runtime);
+
+    let stored = fs::read(diagnostics.path());
+    let Ok(stored) = stored else {
+        panic!("persistent diagnostic database could not be read");
+    };
+    assert!(!contains_bytes(&stored, PAYLOAD_MARKER));
+    assert!(!contains_bytes(&stored, &MESSAGE_ID));
+    assert!(!contains_bytes(&stored, &RECIPIENT_HINT));
+    assert!(!contains_bytes(&stored, b"private-queue-marker"));
 }
 
 #[test]

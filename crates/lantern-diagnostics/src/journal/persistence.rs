@@ -1014,6 +1014,50 @@ mod tests {
     }
 
     #[test]
+    fn excess_record_count_is_rejected_before_records_are_loaded() {
+        let database = TestDatabase::new("excess-record-count");
+        let opened = PersistentDiagnosticJournal::open(database.path(), limits(1, 60), 100);
+        let Ok((mut journal, _)) = opened else {
+            panic!("persistent diagnostics could not open before count change");
+        };
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        drop(journal);
+
+        let connection = Connection::open(database.path());
+        let Ok(connection) = connection else {
+            panic!("test could not open diagnostics database for count change");
+        };
+        assert_eq!(
+            connection.execute(
+                "INSERT INTO diagnostic_records (
+                    sequence,
+                    code,
+                    outcome,
+                    object_count,
+                    size_bucket,
+                    duration_bucket,
+                    expires_at_wall_seconds
+                 ) SELECT 2, code, outcome, object_count, size_bucket,
+                    duration_bucket, expires_at_wall_seconds
+                 FROM diagnostic_records
+                 WHERE sequence = 1",
+                [],
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            connection.execute("UPDATE metadata SET next_sequence = 3", []),
+            Ok(1)
+        );
+        drop(connection);
+
+        assert!(matches!(
+            PersistentDiagnosticJournal::open(database.path(), limits(1, 60), 100),
+            Err(PersistentDiagnosticError::CorruptData)
+        ));
+    }
+
+    #[test]
     fn wrong_application_schema_and_extended_retention_are_rejected() {
         let wrong_application = TestDatabase::new("wrong-application");
         let connection = Connection::open(wrong_application.path());

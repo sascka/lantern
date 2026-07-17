@@ -381,7 +381,7 @@ fn compare_consumed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MAX_MAX_HOPS, MAX_TTL_SECONDS, MIN_MAX_HOPS, MIN_TTL_SECONDS};
+    use crate::{MAX_MAX_HOPS, MAX_TTL_SECONDS, MIN_MAX_HOPS, MIN_TTL_SECONDS, NORMAL_PRIORITY};
 
     const MINIMAL_ENVELOPE_CBOR: [u8; 49] = [
         0xa7, 0x00, 0x01, 0x01, 0x50, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
@@ -816,6 +816,38 @@ mod tests {
                 input.push(state.to_le_bytes()[0]);
             }
             let _result = decode_envelope(&input);
+        }
+    }
+
+    #[test]
+    fn every_single_byte_mutation_is_rejected_or_remains_canonical() {
+        let envelope = Envelope::try_from_fields(
+            PROTOCOL_VERSION,
+            [0xa7; MESSAGE_ID_LENGTH],
+            [0xb8; RECIPIENT_HINT_LENGTH],
+            3_600,
+            8,
+            NORMAL_PRIORITY,
+            vec![0x5c; 1_024],
+        );
+        let Ok(envelope) = envelope else {
+            panic!("valid mutation-test Envelope was rejected");
+        };
+        let encoded = encode_envelope(&envelope);
+        let Ok(mut mutated) = encoded else {
+            panic!("mutation-test Envelope could not be encoded");
+        };
+
+        for index in 0..mutated.len() {
+            mutated[index] ^= 0x01;
+            if let Ok(decoded) = decode_envelope(&mutated) {
+                let reencoded = encode_envelope(&decoded);
+                let Ok(reencoded) = reencoded else {
+                    panic!("accepted mutation could not be encoded again");
+                };
+                assert_eq!(reencoded, mutated);
+            }
+            mutated[index] ^= 0x01;
         }
     }
 

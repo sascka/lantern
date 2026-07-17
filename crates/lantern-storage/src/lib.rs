@@ -1137,6 +1137,52 @@ mod tests {
     }
 
     #[test]
+    fn excess_queue_rows_are_rejected_before_entries_are_loaded() {
+        let database = TemporaryDatabase::new("excess-entry-count");
+        let limits = limits();
+        let mut queue = lantern_core::EnvelopeQueue::new(limits);
+        enqueue(&mut queue, 1, 100, 300, 8);
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("new database could not be opened");
+        };
+        assert_eq!(store.save(&queue, 100), Ok(()));
+        drop(store);
+
+        let connection = Connection::open(database.path());
+        let Ok(connection) = connection else {
+            panic!("test database could not be modified");
+        };
+        for number in 2_u64..=9 {
+            let id = message_id(number);
+            let inserted = connection.execute(
+                "INSERT INTO queue_entries (
+                    message_id,
+                    envelope_cbor,
+                    first_seen_wall_seconds,
+                    local_deadline_wall_seconds,
+                    remaining_ttl_seconds,
+                    hops_taken,
+                    copies_left
+                 ) SELECT ?1, envelope_cbor, first_seen_wall_seconds,
+                    local_deadline_wall_seconds, remaining_ttl_seconds,
+                    hops_taken, copies_left
+                 FROM queue_entries
+                 LIMIT 1",
+                [id.as_bytes().as_slice()],
+            );
+            assert_eq!(inserted, Ok(1));
+        }
+        drop(connection);
+
+        let store = SqliteQueueStore::open(database.path(), limits);
+        let Ok(mut store) = store else {
+            panic!("structurally valid database could not be reopened");
+        };
+        assert_eq!(store.load(101).err(), Some(StorageError::CorruptData));
+    }
+
+    #[test]
     fn wrong_application_schema_and_limits_are_rejected() {
         let wrong_application = TemporaryDatabase::new("wrong-application");
         let connection = Connection::open(wrong_application.path());
