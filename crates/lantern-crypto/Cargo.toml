@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MPL-2.0
+
+[package]
+name = "lantern-crypto"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transport-independent cryptographic message boundary for Lantern"
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { version = "=0.22.1", default-features = false, features = ["alloc"] }
+getrandom = { version = "=0.4.3", default-features = false }
+lantern-core = { path = "../lantern-core" }
+lantern-secret-storage = { path = "../lantern-secret-storage" }
+minicbor = { version = "=2.2.2", default-features = false, features = ["alloc"] }
+vodozemac = { version = "=0.10.0", default-features = false }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+proptest.workspace = true

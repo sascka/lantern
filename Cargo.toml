@@ -3,6 +3,7 @@
 [workspace]
 members = [
     "crates/lantern-core",
+    "crates/lantern-crypto",
     "crates/lantern-diagnostics",
     "crates/lantern-node",
     "crates/lantern-secret-storage",
@@ -19,6 +20,9 @@ license = "MPL-2.0"
 
 [workspace.dependencies]
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+
+[patch.crates-io]
+libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite.git", rev = "5ae7fdf83085c595fd54f977b3a56ccacabaf16b" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
