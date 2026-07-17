@@ -130,6 +130,32 @@ impl FrameTransport for ScriptedTransport {
     }
 }
 
+struct FailingTransferTransport {
+    incoming: VecDeque<Vec<u8>>,
+    successful_sends: usize,
+}
+
+impl FrameTransport for FailingTransferTransport {
+    fn receive_frame(
+        &mut self,
+        destination: &mut [u8],
+    ) -> Result<FrameReceive, TransportFailureKind> {
+        let Some(frame) = self.incoming.pop_front() else {
+            return Ok(FrameReceive::ConnectionClosed);
+        };
+        destination[..frame.len()].copy_from_slice(&frame);
+        Ok(FrameReceive::Complete(frame.len()))
+    }
+
+    fn send_frame(&mut self, _frame: &[u8]) -> Result<(), TransportFailureKind> {
+        if self.successful_sends >= 1 {
+            return Err(TransportFailureKind::Unavailable);
+        }
+        self.successful_sends += 1;
+        Ok(())
+    }
+}
+
 fn queue_limits() -> QueueLimits {
     let result = QueueLimits::try_new(8, 256 * 1024, 16, 600);
     let Ok(limits) = result else {
@@ -584,6 +610,173 @@ fn sync_item_above_local_queue_quota_is_not_persisted() {
     ));
     assert_eq!(runtime.state(), NodeState::Running);
     assert!(runtime.queue().is_empty());
+}
+
+#[test]
+fn sender_reserves_copy_budget_before_transfer_and_persists_it() {
+    let database = TestDatabase::new("sender-copy-reservation");
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101), (2, 102), (3, 103)]);
+    let runtime = NodeRuntime::start_with_clock(
+        database.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    let Ok(mut runtime) = runtime else {
+        panic!("node could not start for sender reservation test");
+    };
+    let envelope = envelope(0x95, 300);
+    let identifier = envelope.message_id();
+    assert!(runtime.enqueue_origin(envelope).is_ok());
+    let request = SyncFrame::request(vec![identifier])
+        .unwrap_or_else(|_| panic!("sender request fixture should be valid"));
+    let transport = ScriptedTransport {
+        incoming: VecDeque::from([sync_frame(&request)]),
+        sent: Vec::new(),
+    };
+    let session = runtime
+        .begin_session(transport, SessionLimits::standard())
+        .unwrap_or_else(|_| panic!("node did not create a sender sync session"));
+
+    let (session, summary) = runtime
+        .send_sync_batch(session)
+        .unwrap_or_else(|_| panic!("sender sync batch should complete"));
+
+    assert_eq!(summary.offered(), 1);
+    assert_eq!(summary.requested(), 1);
+    assert_eq!(summary.transferred(), 1);
+    assert_eq!(
+        runtime
+            .queue()
+            .get(identifier)
+            .map(|entry| entry.route().copies_left()),
+        Some(16)
+    );
+    let sent = session.into_inner().sent;
+    assert_eq!(sent.len(), 3);
+    let transfer =
+        decode_sync_frame(&sent[1]).unwrap_or_else(|_| panic!("sender Transfer should decode"));
+    let SyncFrame::Transfer(item) = transfer else {
+        panic!("sender should emit Transfer after Offer");
+    };
+    assert_eq!(item.message_id(), identifier);
+    assert_eq!(item.route().remaining_ttl_seconds(), 298);
+    assert_eq!(item.route().hops_taken(), 1);
+    assert_eq!(item.route().copies_left(), 16);
+
+    drop(runtime);
+    let (clock, _) = ScriptedClock::new(110, &[(0, 110)]);
+    let recovered = NodeRuntime::start_with_clock(
+        database.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    )
+    .unwrap_or_else(|_| panic!("node did not recover sender reservation"));
+    assert_eq!(
+        recovered
+            .queue()
+            .get(identifier)
+            .map(|entry| entry.route().copies_left()),
+        Some(16)
+    );
+}
+
+#[test]
+fn failed_transfer_burns_reserved_budget_without_failing_the_node() {
+    let database = TestDatabase::new("failed-transfer-reservation");
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101), (2, 102), (3, 103)]);
+    let runtime = NodeRuntime::start_with_clock(
+        database.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    let Ok(mut runtime) = runtime else {
+        panic!("node could not start for failed transfer test");
+    };
+    let envelope = envelope(0x96, 300);
+    let identifier = envelope.message_id();
+    assert!(runtime.enqueue_origin(envelope).is_ok());
+    let request = SyncFrame::request(vec![identifier])
+        .unwrap_or_else(|_| panic!("failed transfer request should be valid"));
+    let transport = FailingTransferTransport {
+        incoming: VecDeque::from([sync_frame(&request)]),
+        successful_sends: 0,
+    };
+    let session = runtime
+        .begin_session(transport, SessionLimits::standard())
+        .unwrap_or_else(|_| panic!("node did not create a failing sync session"));
+
+    assert!(matches!(
+        runtime.send_sync_batch(session),
+        Err(NodeError::Sync(SyncError::Transport(_)))
+    ));
+    assert_eq!(runtime.state(), NodeState::Running);
+    assert_eq!(
+        runtime
+            .queue()
+            .get(identifier)
+            .map(|entry| entry.route().copies_left()),
+        Some(16)
+    );
+
+    drop(runtime);
+    let (clock, _) = ScriptedClock::new(110, &[(0, 110)]);
+    let recovered = NodeRuntime::start_with_clock(
+        database.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    )
+    .unwrap_or_else(|_| panic!("node did not recover failed transfer reservation"));
+    assert_eq!(
+        recovered
+            .queue()
+            .get(identifier)
+            .map(|entry| entry.route().copies_left()),
+        Some(16)
+    );
+}
+
+#[test]
+fn unrequested_offer_does_not_spend_copy_budget() {
+    let database = TestDatabase::new("unrequested-sender-offer");
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101), (2, 102)]);
+    let runtime = NodeRuntime::start_with_clock(
+        database.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    );
+    let Ok(mut runtime) = runtime else {
+        panic!("node could not start for unrequested offer test");
+    };
+    let envelope = envelope(0x97, 300);
+    let identifier = envelope.message_id();
+    assert!(runtime.enqueue_origin(envelope).is_ok());
+    let request =
+        SyncFrame::request(Vec::new()).unwrap_or_else(|_| panic!("empty request should be valid"));
+    let transport = ScriptedTransport {
+        incoming: VecDeque::from([sync_frame(&request)]),
+        sent: Vec::new(),
+    };
+    let session = runtime
+        .begin_session(transport, SessionLimits::standard())
+        .unwrap_or_else(|_| panic!("node did not create an empty-request session"));
+
+    let (_session, summary) = runtime
+        .send_sync_batch(session)
+        .unwrap_or_else(|_| panic!("empty-request batch should complete"));
+
+    assert_eq!(summary.requested(), 0);
+    assert_eq!(
+        runtime
+            .queue()
+            .get(identifier)
+            .map(|entry| entry.route().copies_left()),
+        Some(32)
+    );
 }
 
 #[test]

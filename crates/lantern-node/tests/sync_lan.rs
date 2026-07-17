@@ -126,3 +126,103 @@ fn lan_sync_reaches_sqlite_and_survives_receiver_restart() {
     assert_eq!(entry.route().hops_taken(), 1);
     assert_eq!(entry.route().copies_left(), 16);
 }
+
+#[test]
+fn two_nodes_split_and_persist_copy_budget_over_lan() {
+    let sender_database = TestDatabase::new();
+    let receiver_database = TestDatabase::new();
+    let mut receiver = NodeRuntime::start(
+        &receiver_database.0,
+        QueueLimits::default(),
+        JournalLimits::default(),
+    )
+    .unwrap_or_else(|_| panic!("receiver node should start"));
+    let bind = BindAddress::from_str("127.0.0.1:0")
+        .unwrap_or_else(|_| panic!("loopback bind address should be valid"));
+    let listener =
+        LanListener::bind(bind).unwrap_or_else(|_| panic!("loopback sync listener should bind"));
+    let local = listener
+        .local_address()
+        .unwrap_or_else(|_| panic!("loopback sync listener should report its port"));
+    let peer = PeerAddress::from_str(&format!("127.0.0.1:{}", local.port()))
+        .unwrap_or_else(|_| panic!("loopback peer address should be valid"));
+    let item = transferred();
+    let envelope = item.envelope().clone();
+    let identifier = envelope.message_id();
+    let sender_path = sender_database.0.clone();
+
+    let sender = thread::spawn(move || {
+        let mut node = NodeRuntime::start(
+            &sender_path,
+            QueueLimits::default(),
+            JournalLimits::default(),
+        )
+        .map_err(|_| ())?;
+        node.enqueue_origin(envelope).map_err(|_| ())?;
+        let connection = connect(peer).map_err(|_| ())?;
+        let session = node
+            .begin_session(connection, SessionLimits::standard())
+            .map_err(|_| ())?;
+        let (_session, summary) = node.send_sync_batch(session).map_err(|_| ())?;
+        let copies = node
+            .queue()
+            .get(identifier)
+            .map(|entry| entry.route().copies_left())
+            .ok_or(())?;
+        Ok::<_, ()>((summary, copies))
+    });
+
+    let connection = listener
+        .accept()
+        .unwrap_or_else(|_| panic!("receiver should accept the node connection"));
+    let session = receiver
+        .begin_session(connection, SessionLimits::standard())
+        .unwrap_or_else(|_| panic!("receiver should create a bounded session"));
+    let (_session, received) = receiver
+        .receive_sync_batch(session)
+        .unwrap_or_else(|_| panic!("receiver should persist the node batch"));
+    let (sent, sender_copies) = match sender.join() {
+        Ok(Ok(result)) => result,
+        Ok(Err(())) => panic!("sender node did not complete the LAN batch"),
+        Err(_) => panic!("sender node thread should not panic"),
+    };
+
+    assert_eq!(sent.transferred(), 1);
+    assert_eq!(received.transferred(), 1);
+    assert_eq!(sender_copies, 16);
+    assert_eq!(
+        receiver
+            .queue()
+            .get(identifier)
+            .map(|entry| entry.route().copies_left()),
+        Some(16)
+    );
+    drop(receiver);
+
+    let sender_recovered = NodeRuntime::start(
+        &sender_database.0,
+        QueueLimits::default(),
+        JournalLimits::default(),
+    )
+    .unwrap_or_else(|_| panic!("sender should recover its reserved budget"));
+    let receiver_recovered = NodeRuntime::start(
+        &receiver_database.0,
+        QueueLimits::default(),
+        JournalLimits::default(),
+    )
+    .unwrap_or_else(|_| panic!("receiver should recover its granted budget"));
+    assert_eq!(
+        sender_recovered
+            .queue()
+            .get(identifier)
+            .map(|entry| entry.route().copies_left()),
+        Some(16)
+    );
+    assert_eq!(
+        receiver_recovered
+            .queue()
+            .get(identifier)
+            .map(|entry| entry.route().copies_left()),
+        Some(16)
+    );
+}

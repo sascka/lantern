@@ -16,7 +16,10 @@ use lantern_diagnostics::{
     PersistentDiagnosticRecovery, SizeBucket,
 };
 use lantern_storage::{ClockRecovery, RecoveryReport, SqliteQueueStore};
-use lantern_sync::{EnvelopeSink, SyncSinkError, SyncSummary, TransferredEnvelope, receive_batch};
+use lantern_sync::{
+    EnvelopeSink, EnvelopeSource, MAX_OFFERED_IDS, RouteGrant, SyncSinkError, SyncSourceError,
+    SyncSummary, TransferredEnvelope, receive_batch, send_batch_from_source,
+};
 use lantern_time::{ClockStatus, SystemRuntimeClock};
 use lantern_transport::{BoundedSession, FrameTransport, SessionLimits};
 
@@ -120,6 +123,7 @@ pub struct NodeRuntime<C = SystemRuntimeClock> {
     startup_recovery: RecoveryReport,
     startup_diagnostic_recovery: PersistentDiagnosticRecovery,
     last_wall_seconds: u64,
+    sync_offer_cursor: Option<MessageId>,
 }
 
 impl NodeRuntime<SystemRuntimeClock> {
@@ -214,6 +218,7 @@ impl<C: NodeClock> NodeRuntime<C> {
             startup_recovery,
             startup_diagnostic_recovery,
             last_wall_seconds: reading.wall_seconds(),
+            sync_offer_cursor: None,
         };
 
         runtime.record_event(EventCode::NodeStarted, EventOutcome::Success, 1)?;
@@ -323,6 +328,23 @@ impl<C: NodeClock> NodeRuntime<C> {
         result.map_err(NodeError::from)
     }
 
+    pub fn send_sync_batch<T: FrameTransport>(
+        &mut self,
+        session: BoundedSession<T>,
+    ) -> Result<(BoundedSession<T>, SyncSummary), NodeError> {
+        self.observe_and_persist()?;
+        let offered = self.select_sync_offer();
+        let mut source = NodeSyncSource {
+            runtime: self,
+            internal_error: None,
+        };
+        let result = send_batch_from_source(session, &offered, &mut source);
+        if let Some(error) = source.internal_error {
+            return Err(error);
+        }
+        result.map_err(NodeError::from)
+    }
+
     pub fn stop(&mut self) -> Result<NodeMaintenance, NodeError> {
         let mut maintenance = self.observe_and_persist()?;
         if let Err(error) = self.record_event_with_report(
@@ -412,6 +434,51 @@ impl<C: NodeClock> NodeRuntime<C> {
         Ok(outcome)
     }
 
+    fn select_sync_offer(&mut self) -> Vec<MessageId> {
+        select_sync_offer_ids(
+            &self.queue,
+            &mut self.sync_offer_cursor,
+            self.last_wall_seconds,
+        )
+    }
+
+    fn prepare_transfer(
+        &mut self,
+        message_id: MessageId,
+    ) -> Result<Option<TransferredEnvelope>, NodeError> {
+        self.observe_and_persist()?;
+        let now = self.last_wall_seconds;
+        let reservation = match self.queue.reserve_forward(message_id, now) {
+            Ok(reservation) => reservation,
+            Err(error) => return self.fail(error.into()),
+        };
+        let Some(reservation) = reservation else {
+            return Ok(None);
+        };
+        let envelope = match self.queue.get(message_id) {
+            Some(entry) => entry.envelope().clone(),
+            None => {
+                return self.fail(lantern_core::QueueError::InvariantViolation.into());
+            }
+        };
+        let grant = match RouteGrant::try_new(
+            reservation.remaining_ttl(),
+            reservation.hops_taken(),
+            reservation.receiver_copies(),
+        ) {
+            Ok(grant) => grant,
+            Err(error) => return self.fail(error.into()),
+        };
+        let item = match TransferredEnvelope::try_new(envelope, grant) {
+            Ok(item) => item,
+            Err(error) => return self.fail(error.into()),
+        };
+        if let Err(error) = self.store.save(&self.queue, now) {
+            return self.fail(error.into());
+        }
+        Ok(Some(item))
+    }
+
     fn observe_time(&mut self) -> Result<(u64, NodeMaintenance), NodeError> {
         self.ensure_running()?;
         let reading = match self.clock.read() {
@@ -492,9 +559,62 @@ impl<C: NodeClock> NodeRuntime<C> {
     }
 }
 
+fn select_sync_offer_ids(
+    queue: &EnvelopeQueue,
+    cursor: &mut Option<MessageId>,
+    now: u64,
+) -> Vec<MessageId> {
+    let eligible = queue
+        .entries()
+        .filter(|entry| {
+            entry.route().local_deadline() > now
+                && entry.route().copies_left() > 1
+                && entry.route().hops_taken() < entry.envelope().max_hops().get()
+        })
+        .map(|entry| entry.envelope().message_id())
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+
+    let start = cursor.map_or(0, |current| {
+        eligible.partition_point(|identifier| *identifier <= current)
+    });
+    let mut selected = eligible[start..]
+        .iter()
+        .chain(eligible[..start].iter())
+        .take(MAX_OFFERED_IDS)
+        .copied()
+        .collect::<Vec<_>>();
+    *cursor = selected.last().copied();
+    selected.sort_unstable();
+    selected
+}
+
 struct NodeSyncSink<'runtime, C> {
     runtime: &'runtime mut NodeRuntime<C>,
     internal_error: Option<NodeError>,
+}
+
+struct NodeSyncSource<'runtime, C> {
+    runtime: &'runtime mut NodeRuntime<C>,
+    internal_error: Option<NodeError>,
+}
+
+impl<C: NodeClock> EnvelopeSource for NodeSyncSource<'_, C> {
+    fn prepare_transfer(
+        &mut self,
+        message_id: MessageId,
+    ) -> Result<TransferredEnvelope, SyncSourceError> {
+        match self.runtime.prepare_transfer(message_id) {
+            Ok(Some(item)) => Ok(item),
+            Ok(None) => Err(SyncSourceError::Rejected),
+            Err(error) => {
+                self.internal_error = Some(error);
+                Err(SyncSourceError::Unavailable)
+            }
+        }
+    }
 }
 
 impl<C: NodeClock> EnvelopeSink for NodeSyncSink<'_, C> {
@@ -587,6 +707,8 @@ impl<C> fmt::Debug for NodeRuntime<C> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use lantern_core::{NORMAL_PRIORITY, PROTOCOL_VERSION};
     use lantern_diagnostics::{
@@ -672,5 +794,51 @@ mod tests {
 
         maintenance.include_journal_maintenance(journal.maintain(161));
         assert_eq!(maintenance.expired_diagnostics(), 1);
+    }
+
+    #[test]
+    fn sync_offer_cursor_reaches_items_beyond_the_first_batch() {
+        let limits = QueueLimits::try_new(64, 1024 * 1024, 64, 600)
+            .unwrap_or_else(|_| panic!("rotation queue limits should be valid"));
+        let mut queue = EnvelopeQueue::new(limits);
+        for number in 1..=40 {
+            let item = envelope(number);
+            queue
+                .enqueue(item.clone(), route(&item, 100), 100)
+                .unwrap_or_else(|_| panic!("rotation fixture should enter the queue"));
+        }
+        let wait = envelope(50);
+        let wait_route = LocalRouteRecord::from_received(&wait, 100, 60, 1, 1)
+            .unwrap_or_else(|_| panic!("wait route fixture should be valid"));
+        queue
+            .enqueue(wait.clone(), wait_route, 100)
+            .unwrap_or_else(|_| panic!("wait fixture should enter the queue"));
+        let hop_limited = envelope(51);
+        let hop_route = LocalRouteRecord::from_received(
+            &hop_limited,
+            100,
+            60,
+            u64::from(hop_limited.max_hops().get()),
+            8,
+        )
+        .unwrap_or_else(|_| panic!("hop-limited route fixture should be valid"));
+        queue
+            .enqueue(hop_limited.clone(), hop_route, 100)
+            .unwrap_or_else(|_| panic!("hop-limited fixture should enter the queue"));
+        let mut cursor = None;
+
+        let first = select_sync_offer_ids(&queue, &mut cursor, 100);
+        let second = select_sync_offer_ids(&queue, &mut cursor, 100);
+        let reached = first
+            .iter()
+            .chain(second.iter())
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(first.len(), MAX_OFFERED_IDS);
+        assert_eq!(second.len(), MAX_OFFERED_IDS);
+        assert_eq!(reached.len(), 40);
+        assert!(!reached.contains(&wait.message_id()));
+        assert!(!reached.contains(&hop_limited.message_id()));
     }
 }
