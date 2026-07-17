@@ -12,3 +12,9 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+lantern-transport = { path = "../lantern-transport" }
+
+[dev-dependencies]
+proptest.workspace = true

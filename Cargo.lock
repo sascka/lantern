@@ -439,6 +439,10 @@ dependencies = [
 [[package]]
 name = "lantern-lan"
 version = "0.1.0"
+dependencies = [
+ "lantern-transport",
+ "proptest",
+]
 
 [[package]]
 name = "lantern-node"

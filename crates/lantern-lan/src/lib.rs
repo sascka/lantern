@@ -11,9 +11,11 @@
 mod address;
 mod connection;
 mod error;
+mod framing;
 mod hello;
 
 pub use address::{AddressError, BindAddress, PeerAddress};
 pub use connection::{LanConnection, LanListener, connect};
 pub use error::LanError;
+pub use framing::FRAME_LENGTH_PREFIX_BYTES;
 pub use hello::LAN_PROTOCOL_VERSION;
