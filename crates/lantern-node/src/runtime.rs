@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use core::fmt;
-use std::path::Path;
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use lantern_core::{
     ContainerState, EnqueueOutcome, Envelope, EnvelopeQueue, LocalRouteRecord, QueueEffects,
     QueueLimits,
 };
 use lantern_diagnostics::{
-    DiagnosticEvent, DiagnosticJournal, EventCode, EventOutcome, JournalLimits, JournalMaintenance,
-    JournalView, SizeBucket,
+    DiagnosticEvent, EventCode, EventOutcome, JournalLimits, JournalMaintenance, JournalView,
+    PersistentDiagnosticRecovery, SizeBucket,
 };
 use lantern_storage::{ClockRecovery, RecoveryReport, SqliteQueueStore};
 use lantern_time::{ClockStatus, SystemRuntimeClock};
 use lantern_transport::{BoundedSession, FrameTransport, SessionLimits};
 
-use crate::{NodeClock, NodeError};
+use crate::{NodeClock, NodeError, diagnostics::NodeDiagnostics, profile_lock::ProfileLock};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeState {
@@ -107,10 +111,13 @@ impl NodeEnqueueReport {
 pub struct NodeRuntime<C = SystemRuntimeClock> {
     state: NodeState,
     clock: C,
+    profile_lock: Option<ProfileLock>,
+    diagnostic_lock: Option<ProfileLock>,
     store: SqliteQueueStore,
     queue: EnvelopeQueue,
-    diagnostics: DiagnosticJournal,
+    diagnostics: NodeDiagnostics,
     startup_recovery: RecoveryReport,
+    startup_diagnostic_recovery: PersistentDiagnosticRecovery,
     last_wall_seconds: u64,
 }
 
@@ -123,6 +130,22 @@ impl NodeRuntime<SystemRuntimeClock> {
         let clock = SystemRuntimeClock::start()?;
         Self::start_with_clock(database_path, queue_limits, journal_limits, clock)
     }
+
+    pub fn start_with_persistent_diagnostics(
+        database_path: &Path,
+        diagnostic_path: &Path,
+        queue_limits: QueueLimits,
+        journal_limits: JournalLimits,
+    ) -> Result<Self, NodeError> {
+        let clock = SystemRuntimeClock::start()?;
+        Self::start_with_clock_and_persistent_diagnostics(
+            database_path,
+            diagnostic_path,
+            queue_limits,
+            journal_limits,
+            clock,
+        )
+    }
 }
 
 impl<C: NodeClock> NodeRuntime<C> {
@@ -130,19 +153,65 @@ impl<C: NodeClock> NodeRuntime<C> {
         database_path: &Path,
         queue_limits: QueueLimits,
         journal_limits: JournalLimits,
+        clock: C,
+    ) -> Result<Self, NodeError> {
+        Self::start_configured(database_path, None, queue_limits, journal_limits, clock)
+    }
+
+    pub fn start_with_clock_and_persistent_diagnostics(
+        database_path: &Path,
+        diagnostic_path: &Path,
+        queue_limits: QueueLimits,
+        journal_limits: JournalLimits,
+        clock: C,
+    ) -> Result<Self, NodeError> {
+        Self::start_configured(
+            database_path,
+            Some(diagnostic_path),
+            queue_limits,
+            journal_limits,
+            clock,
+        )
+    }
+
+    fn start_configured(
+        database_path: &Path,
+        diagnostic_path: Option<&Path>,
+        queue_limits: QueueLimits,
+        journal_limits: JournalLimits,
         mut clock: C,
     ) -> Result<Self, NodeError> {
+        if let Some(path) = diagnostic_path {
+            validate_profile_paths(database_path, path)?;
+        }
+        let profile_lock = ProfileLock::acquire(database_path)?;
+        let diagnostic_lock = diagnostic_path.map(ProfileLock::acquire).transpose()?;
         let reading = clock.read()?;
         let mut store = SqliteQueueStore::open(database_path, queue_limits)?;
         let recovered = store.load(reading.wall_seconds())?;
         let startup_recovery = recovered.report();
+        let (mut diagnostics, startup_diagnostic_recovery) = match diagnostic_path {
+            Some(path) => {
+                NodeDiagnostics::persistent(path, journal_limits, reading.wall_seconds())?
+            }
+            None => (
+                NodeDiagnostics::memory(journal_limits),
+                PersistentDiagnosticRecovery::default(),
+            ),
+        };
+        if startup_recovery.clock_recovery() == ClockRecovery::RollbackDetected {
+            diagnostics.clear(reading.wall_seconds())?;
+        }
         let mut runtime = Self {
             state: NodeState::Running,
             clock,
+            profile_lock: Some(profile_lock),
+            diagnostic_lock,
             store,
             queue: recovered.into_queue(),
-            diagnostics: DiagnosticJournal::new(journal_limits),
+            diagnostics,
             startup_recovery,
+            startup_diagnostic_recovery,
             last_wall_seconds: reading.wall_seconds(),
         };
 
@@ -173,6 +242,14 @@ impl<C: NodeClock> NodeRuntime<C> {
 
     pub const fn startup_recovery(&self) -> RecoveryReport {
         self.startup_recovery
+    }
+
+    pub const fn startup_diagnostic_recovery(&self) -> PersistentDiagnosticRecovery {
+        self.startup_diagnostic_recovery
+    }
+
+    pub const fn persistent_diagnostics_enabled(&self) -> bool {
+        self.diagnostics.is_persistent()
     }
 
     pub fn maintain(&mut self) -> Result<NodeMaintenance, NodeError> {
@@ -217,7 +294,7 @@ impl<C: NodeClock> NodeRuntime<C> {
 
     pub fn diagnostics(&mut self) -> Result<JournalView<'_>, NodeError> {
         self.observe_and_persist()?;
-        Ok(self.diagnostics.view(self.last_wall_seconds))
+        self.diagnostics.view(self.last_wall_seconds)
     }
 
     pub fn begin_session<T: FrameTransport>(
@@ -240,6 +317,8 @@ impl<C: NodeClock> NodeRuntime<C> {
             return self.fail(error);
         }
         self.state = NodeState::Stopped;
+        self.profile_lock = None;
+        self.diagnostic_lock = None;
         Ok(maintenance)
     }
 
@@ -296,9 +375,16 @@ impl<C: NodeClock> NodeRuntime<C> {
         };
         maintenance.include_queue_effects(&effects);
         if maintenance.clock_rollback_detected {
-            maintenance.cleared_diagnostics = self.diagnostics.clear();
+            let cleared = match self.diagnostics.clear(now) {
+                Ok(cleared) => cleared,
+                Err(error) => return self.fail(error),
+            };
+            maintenance.cleared_diagnostics = cleared;
         } else {
-            let journal_maintenance = self.diagnostics.maintain(now);
+            let journal_maintenance = match self.diagnostics.maintain(now) {
+                Ok(maintenance) => maintenance,
+                Err(error) => return self.fail(error),
+            };
             maintenance.include_journal_maintenance(journal_maintenance);
         }
         self.last_wall_seconds = now;
@@ -340,8 +426,56 @@ impl<C: NodeClock> NodeRuntime<C> {
 
     fn fail<T>(&mut self, error: NodeError) -> Result<T, NodeError> {
         self.state = NodeState::Failed;
+        self.profile_lock = None;
+        self.diagnostic_lock = None;
         Err(error)
     }
+}
+
+fn validate_profile_paths(database_path: &Path, diagnostic_path: &Path) -> Result<(), NodeError> {
+    let database_path = normalize_storage_path(database_path)?;
+    let diagnostic_path = normalize_storage_path(diagnostic_path)?;
+    let queue_files = [
+        database_path.clone(),
+        path_with_suffix(&database_path, "-journal"),
+        path_with_suffix(&database_path, "-wal"),
+        path_with_suffix(&database_path, "-shm"),
+        path_with_suffix(&database_path, ".lock"),
+    ];
+    let diagnostic_files = [
+        diagnostic_path.clone(),
+        path_with_suffix(&diagnostic_path, "-journal"),
+        path_with_suffix(&diagnostic_path, "-wal"),
+        path_with_suffix(&diagnostic_path, "-shm"),
+        path_with_suffix(&diagnostic_path, ".lock"),
+    ];
+    if queue_files.iter().any(|queue| {
+        diagnostic_files
+            .iter()
+            .any(|diagnostic| queue == diagnostic)
+    }) {
+        return Err(NodeError::InvalidProfilePaths);
+    }
+    Ok(())
+}
+
+fn normalize_storage_path(path: &Path) -> Result<PathBuf, NodeError> {
+    let filename = path.file_name().ok_or(NodeError::InvalidProfilePaths)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = match parent {
+        Some(parent) => parent,
+        None => Path::new("."),
+    };
+    let parent = fs::canonicalize(parent).map_err(|_| NodeError::InvalidProfilePaths)?;
+    Ok(parent.join(filename))
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = OsString::from(path.as_os_str());
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 impl<C> fmt::Debug for NodeRuntime<C> {
@@ -353,6 +487,7 @@ impl<C> fmt::Debug for NodeRuntime<C> {
             .field("queue_entries", &self.queue.len())
             .field("queue_size", &queue_size)
             .field("diagnostic_records", &self.diagnostics.len())
+            .field("persistent_diagnostics", &self.diagnostics.is_persistent())
             .field("startup_recovery", &self.startup_recovery)
             .finish_non_exhaustive()
     }
@@ -362,7 +497,9 @@ impl<C> fmt::Debug for NodeRuntime<C> {
 mod tests {
     use super::*;
     use lantern_core::{NORMAL_PRIORITY, PROTOCOL_VERSION};
-    use lantern_diagnostics::{DIAGNOSTIC_RECORD_LOGICAL_BYTES, DiagnosticEvent};
+    use lantern_diagnostics::{
+        DIAGNOSTIC_RECORD_LOGICAL_BYTES, DiagnosticEvent, DiagnosticJournal,
+    };
 
     fn envelope(number: u8) -> Envelope {
         let result = Envelope::try_from_fields(

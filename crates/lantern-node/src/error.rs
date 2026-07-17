@@ -3,25 +3,33 @@
 use core::fmt;
 
 use lantern_core::{CoreError, QueueError};
-use lantern_diagnostics::DiagnosticError;
+use lantern_diagnostics::{DiagnosticError, PersistentDiagnosticError};
 use lantern_storage::StorageError;
 use lantern_time::ClockError;
+
+use crate::ProfileLockError;
 
 /// Safe node error that contains no path, message bytes or exact time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeError {
     NotRunning,
+    InvalidProfilePaths,
     Clock(ClockError),
     Core(CoreError),
     Queue(QueueError),
     Storage(StorageError),
     Diagnostics(DiagnosticError),
+    PersistentDiagnostics(PersistentDiagnosticError),
+    ProfileLock(ProfileLockError),
 }
 
 impl fmt::Display for NodeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotRunning => formatter.write_str("node is not running"),
+            Self::InvalidProfilePaths => {
+                formatter.write_str("node profile paths overlap or cannot be resolved")
+            }
             Self::Clock(error) => write!(formatter, "node clock failed: {error}"),
             Self::Core(error) => write!(formatter, "node rejected core data: {error}"),
             Self::Queue(error) => write!(formatter, "node queue failed: {error}"),
@@ -29,6 +37,10 @@ impl fmt::Display for NodeError {
             Self::Diagnostics(error) => {
                 write!(formatter, "node diagnostics failed: {error}")
             }
+            Self::PersistentDiagnostics(error) => {
+                write!(formatter, "node persistent diagnostics failed: {error}")
+            }
+            Self::ProfileLock(error) => write!(formatter, "node profile lock failed: {error}"),
         }
     }
 }
@@ -62,5 +74,17 @@ impl From<StorageError> for NodeError {
 impl From<DiagnosticError> for NodeError {
     fn from(error: DiagnosticError) -> Self {
         Self::Diagnostics(error)
+    }
+}
+
+impl From<PersistentDiagnosticError> for NodeError {
+    fn from(error: PersistentDiagnosticError) -> Self {
+        Self::PersistentDiagnostics(error)
+    }
+}
+
+impl From<ProfileLockError> for NodeError {
+    fn from(error: ProfileLockError) -> Self {
+        Self::ProfileLock(error)
     }
 }
