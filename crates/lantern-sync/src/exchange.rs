@@ -149,3 +149,181 @@ fn count_u8(count: usize) -> Result<u8, SyncError> {
     u8::try_from(count).map_err(|_| SyncError::InvalidIdentifierCount)
 }
 
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use lantern_core::{MESSAGE_ID_LENGTH, NORMAL_PRIORITY, PROTOCOL_VERSION};
+    use lantern_transport::{FrameReceive, SessionLimits, TransportFailureKind};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct MemoryTransport {
+        incoming: VecDeque<Vec<u8>>,
+        sent: Vec<Vec<u8>>,
+    }
+
+    impl FrameTransport for MemoryTransport {
+        fn receive_frame(
+            &mut self,
+            destination: &mut [u8],
+        ) -> Result<FrameReceive, TransportFailureKind> {
+            let Some(frame) = self.incoming.pop_front() else {
+                return Ok(FrameReceive::ConnectionClosed);
+            };
+            if frame.len() > destination.len() {
+                return Err(TransportFailureKind::ResourceExhausted);
+            }
+            destination[..frame.len()].copy_from_slice(&frame);
+            Ok(FrameReceive::Complete(frame.len()))
+        }
+
+        fn send_frame(&mut self, frame: &[u8]) -> Result<(), TransportFailureKind> {
+            self.sent.push(frame.to_vec());
+            Ok(())
+        }
+    }
+
+    fn envelope(id: u8) -> Envelope {
+        match Envelope::try_from_fields(
+            PROTOCOL_VERSION,
+            [id; MESSAGE_ID_LENGTH],
+            [0x33; 16],
+            300,
+            4,
+            NORMAL_PRIORITY,
+            b"SYNTHETIC EXCHANGE PAYLOAD".to_vec(),
+        ) {
+            Ok(envelope) => envelope,
+            Err(_) => panic!("exchange test Envelope should be valid"),
+        }
+    }
+
+    fn encoded(frame: &SyncFrame) -> Vec<u8> {
+        encode_sync_frame(frame).unwrap_or_else(|_| panic!("sync frame fixture should encode"))
+    }
+
+    #[derive(Default)]
+    struct TestSink {
+        known: Vec<MessageId>,
+        accepted: Vec<Envelope>,
+    }
+
+    impl EnvelopeSink for TestSink {
+        fn wants(&mut self, message_id: MessageId) -> Result<bool, SyncSinkError> {
+            Ok(!self.known.contains(&message_id))
+        }
+
+        fn accept(&mut self, envelope: Envelope) -> Result<(), SyncSinkError> {
+            self.accepted.push(envelope);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sender_rejects_unoffered_request_and_consumes_the_session() {
+        let request = SyncFrame::request(vec![MessageId::from_bytes([0x77; 16])]);
+        let Ok(request) = request else {
+            panic!("request fixture should be valid");
+        };
+        let encoded = encode_sync_frame(&request);
+        let Ok(encoded) = encoded else {
+            panic!("request fixture should encode");
+        };
+        let transport = MemoryTransport {
+            incoming: VecDeque::from([encoded]),
+            sent: Vec::new(),
+        };
+        let session = BoundedSession::new(transport, SessionLimits::default());
+        assert!(matches!(
+            send_batch(session, &[envelope(0x11)]),
+            Err(SyncError::RequestNotOffered)
+        ));
+    }
+
+    #[test]
+    fn sender_canonicalizes_offer_and_follows_request_order() {
+        let first = envelope(0x11);
+        let second = envelope(0x22);
+        let request = SyncFrame::request(vec![second.message_id()])
+            .unwrap_or_else(|_| panic!("request fixture should be valid"));
+        let transport = MemoryTransport {
+            incoming: VecDeque::from([encoded(&request)]),
+            sent: Vec::new(),
+        };
+        let session = BoundedSession::new(transport, SessionLimits::default());
+
+        let (session, summary) = send_batch(session, &[second.clone(), first.clone()])
+            .unwrap_or_else(|_| panic!("sender batch should complete"));
+        let sent = session.into_inner().sent;
+        let offer = SyncFrame::offer(vec![first.message_id(), second.message_id()])
+            .unwrap_or_else(|_| panic!("offer fixture should be valid"));
+
+        assert_eq!(summary.offered(), 2);
+        assert_eq!(summary.requested(), 1);
+        assert_eq!(summary.transferred(), 1);
+        assert_eq!(sent[0], encoded(&offer));
+        assert_eq!(decode_sync_frame(&sent[1]), Ok(SyncFrame::transfer(second)));
+        assert_eq!(sent[2], encoded(&SyncFrame::done()));
+    }
+
+    #[test]
+    fn duplicate_local_offer_is_rejected_before_transport_use() {
+        let session = BoundedSession::new(MemoryTransport::default(), SessionLimits::default());
+        assert!(matches!(
+            send_batch(session, &[envelope(0x11), envelope(0x11)]),
+            Err(SyncError::DuplicateOfferedEnvelope)
+        ));
+    }
+
+    #[test]
+    fn receiver_does_not_request_an_envelope_it_already_has() {
+        let identifier = MessageId::from_bytes([0x31; MESSAGE_ID_LENGTH]);
+        let offer = SyncFrame::offer(vec![identifier])
+            .unwrap_or_else(|_| panic!("offer fixture should be valid"));
+        let transport = MemoryTransport {
+            incoming: VecDeque::from([encoded(&offer), encoded(&SyncFrame::done())]),
+            sent: Vec::new(),
+        };
+        let session = BoundedSession::new(transport, SessionLimits::default());
+        let mut sink = TestSink {
+            known: vec![identifier],
+            accepted: Vec::new(),
+        };
+
+        let (session, summary) = receive_batch(session, &mut sink)
+            .unwrap_or_else(|_| panic!("known item exchange should complete"));
+
+        assert_eq!(summary.offered(), 1);
+        assert_eq!(summary.requested(), 0);
+        assert_eq!(summary.transferred(), 0);
+        assert!(sink.accepted.is_empty());
+        assert_eq!(
+            session.into_inner().sent,
+            [encoded(&SyncFrame::request(Vec::new()).unwrap_or_else(
+                |_| panic!("empty request should be valid")
+            ))]
+        );
+    }
+
+    #[test]
+    fn receiver_rejects_a_transfer_that_was_not_requested() {
+        let requested_id = MessageId::from_bytes([0x41; MESSAGE_ID_LENGTH]);
+        let offer = SyncFrame::offer(vec![requested_id])
+            .unwrap_or_else(|_| panic!("offer fixture should be valid"));
+        let wrong_transfer = SyncFrame::transfer(envelope(0x42));
+        let transport = MemoryTransport {
+            incoming: VecDeque::from([encoded(&offer), encoded(&wrong_transfer)]),
+            sent: Vec::new(),
+        };
+        let session = BoundedSession::new(transport, SessionLimits::default());
+        let mut sink = TestSink::default();
+
+        assert!(matches!(
+            receive_batch(session, &mut sink),
+            Err(SyncError::TransferNotRequested)
+        ));
+        assert!(sink.accepted.is_empty());
+    }
+}

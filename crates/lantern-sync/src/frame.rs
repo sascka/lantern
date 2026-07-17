@@ -200,3 +200,174 @@ fn validate_identifiers(identifiers: &[MessageId]) -> Result<(), SyncError> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lantern_core::{MAX_PROTECTED_PAYLOAD_SIZE, NORMAL_PRIORITY, PROTOCOL_VERSION};
+
+    fn envelope(id: u8) -> Envelope {
+        match Envelope::try_from_fields(
+            PROTOCOL_VERSION,
+            [id; MESSAGE_ID_LENGTH],
+            [0x22; 16],
+            300,
+            4,
+            NORMAL_PRIORITY,
+            b"SYNTHETIC SYNC PAYLOAD".to_vec(),
+        ) {
+            Ok(envelope) => envelope,
+            Err(_) => panic!("sync test Envelope should be valid"),
+        }
+    }
+
+    #[test]
+    fn all_frame_types_have_fixed_vectors_or_canonical_round_trips() {
+        let offer = SyncFrame::offer(vec![MessageId::from_bytes([0x11; 16])]);
+        let Ok(offer) = offer else {
+            panic!("one identifier should form an offer");
+        };
+        let encoded = encode_sync_frame(&offer);
+        let Ok(encoded) = encoded else {
+            panic!("offer should encode");
+        };
+        let mut expected = vec![1, 1, 0, 1];
+        expected.extend_from_slice(&[0x11; 16]);
+        assert_eq!(encoded, expected);
+
+        assert_eq!(
+            encode_sync_frame(
+                &SyncFrame::request(Vec::new())
+                    .unwrap_or_else(|_| panic!("empty request should be valid"))
+            ),
+            Ok(vec![1, 2, 0, 0])
+        );
+        assert_eq!(encode_sync_frame(&SyncFrame::Done), Ok(vec![1, 4, 0, 0]));
+
+        let transfer = SyncFrame::transfer(envelope(0x31));
+        let encoded = encode_sync_frame(&transfer);
+        let Ok(encoded) = encoded else {
+            panic!("transfer should encode");
+        };
+        let decoded = decode_sync_frame(&encoded);
+        let Ok(SyncFrame::Transfer(decoded)) = decoded else {
+            panic!("transfer should decode");
+        };
+        assert_eq!(decoded, envelope(0x31));
+    }
+
+    #[test]
+    fn identifiers_must_be_sorted_unique_and_bounded() {
+        let duplicate = vec![MessageId::from_bytes([0x11; 16]); 2];
+        assert!(matches!(
+            SyncFrame::offer(duplicate),
+            Err(SyncError::IdentifiersNotCanonical)
+        ));
+        let descending = vec![
+            MessageId::from_bytes([0x22; 16]),
+            MessageId::from_bytes([0x11; 16]),
+        ];
+        assert!(matches!(
+            SyncFrame::request(descending),
+            Err(SyncError::IdentifiersNotCanonical)
+        ));
+        let excessive = vec![MessageId::from_bytes([0x11; 16]); MAX_OFFERED_IDS + 1];
+        assert!(matches!(
+            SyncFrame::offer(excessive),
+            Err(SyncError::InvalidIdentifierCount)
+        ));
+    }
+
+    #[test]
+    fn malformed_lengths_versions_types_and_transfer_ids_are_rejected() {
+        assert_eq!(decode_sync_frame(&[]), Err(SyncError::FrameTooSmall));
+        assert_eq!(
+            decode_sync_frame(&[2, 4, 0, 0]),
+            Err(SyncError::UnsupportedVersion)
+        );
+        assert_eq!(
+            decode_sync_frame(&[1, 9, 0, 0]),
+            Err(SyncError::UnsupportedFrameType)
+        );
+        assert_eq!(
+            decode_sync_frame(&[1, 1, 0, 1]),
+            Err(SyncError::InvalidFrameLength)
+        );
+        assert_eq!(
+            decode_sync_frame(&[1, 4, 0, 1]),
+            Err(SyncError::InvalidFrameLength)
+        );
+
+        let transfer = SyncFrame::transfer(envelope(0x41));
+        let encoded = encode_sync_frame(&transfer);
+        let Ok(mut encoded) = encoded else {
+            panic!("transfer should encode");
+        };
+        encoded[HEADER_BYTES] ^= 1;
+        assert_eq!(
+            decode_sync_frame(&encoded),
+            Err(SyncError::EnvelopeIdentifierMismatch)
+        );
+    }
+
+    #[test]
+    fn debug_output_contains_no_identifiers_or_envelope_bytes() {
+        let marker = "85, 85, 85";
+        let offer = SyncFrame::offer(vec![MessageId::from_bytes([0x55; 16])]);
+        let Ok(offer) = offer else {
+            panic!("one identifier should form an offer");
+        };
+        assert!(!format!("{offer:?}").contains(marker));
+        assert!(!format!("{:?}", SyncFrame::transfer(envelope(0x55))).contains("SYNTHETIC"));
+    }
+
+    #[test]
+    fn every_truncated_canonical_frame_is_rejected() {
+        let frames = [
+            encode_sync_frame(
+                &SyncFrame::offer(vec![MessageId::from_bytes([0x11; MESSAGE_ID_LENGTH])])
+                    .unwrap_or_else(|_| panic!("offer fixture should be valid")),
+            )
+            .unwrap_or_else(|_| panic!("offer fixture should encode")),
+            encode_sync_frame(&SyncFrame::transfer(envelope(0x21)))
+                .unwrap_or_else(|_| panic!("transfer fixture should encode")),
+            encode_sync_frame(&SyncFrame::done())
+                .unwrap_or_else(|_| panic!("done fixture should encode")),
+        ];
+
+        for frame in frames {
+            for truncated_length in 0..frame.len() {
+                assert!(decode_sync_frame(&frame[..truncated_length]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn exact_batch_and_payload_limits_fit_one_transport_frame() {
+        let identifiers = (0_u8..32)
+            .map(|value| MessageId::from_bytes([value; MESSAGE_ID_LENGTH]))
+            .collect::<Vec<_>>();
+        assert_eq!(identifiers.len(), MAX_OFFERED_IDS);
+        let offer = SyncFrame::offer(identifiers)
+            .unwrap_or_else(|_| panic!("maximum offer should be valid"));
+        let encoded_offer =
+            encode_sync_frame(&offer).unwrap_or_else(|_| panic!("maximum offer should encode"));
+        assert_eq!(
+            encoded_offer.len(),
+            HEADER_BYTES + MAX_OFFERED_IDS * MESSAGE_ID_LENGTH
+        );
+
+        let maximum = Envelope::try_from_fields(
+            PROTOCOL_VERSION,
+            [0x71; MESSAGE_ID_LENGTH],
+            [0x72; 16],
+            300,
+            4,
+            NORMAL_PRIORITY,
+            vec![0x73; MAX_PROTECTED_PAYLOAD_SIZE],
+        )
+        .unwrap_or_else(|_| panic!("maximum Envelope should be valid"));
+        let encoded_transfer = encode_sync_frame(&SyncFrame::transfer(maximum))
+            .unwrap_or_else(|_| panic!("maximum transfer should encode"));
+        assert!(encoded_transfer.len() <= MAX_FRAME_BYTES);
+    }
+}
