@@ -5,12 +5,14 @@ use std::thread;
 
 use lantern_core::{Envelope, MESSAGE_ID_LENGTH, MessageId, NORMAL_PRIORITY, PROTOCOL_VERSION};
 use lantern_lan::{BindAddress, LanListener, PeerAddress, connect};
-use lantern_sync::{EnvelopeSink, SyncSinkError, receive_batch, send_batch};
+use lantern_sync::{
+    EnvelopeSink, RouteGrant, SyncSinkError, TransferredEnvelope, receive_batch, send_batch,
+};
 use lantern_transport::{BoundedSession, SessionLimits};
 
 #[derive(Default)]
 struct MemorySink {
-    accepted: Vec<Envelope>,
+    accepted: Vec<TransferredEnvelope>,
 }
 
 impl EnvelopeSink for MemorySink {
@@ -18,11 +20,11 @@ impl EnvelopeSink for MemorySink {
         Ok(self
             .accepted
             .iter()
-            .all(|envelope| envelope.message_id() != message_id))
+            .all(|item| item.message_id() != message_id))
     }
 
-    fn accept(&mut self, envelope: Envelope) -> Result<(), SyncSinkError> {
-        self.accepted.push(envelope);
+    fn accept(&mut self, item: TransferredEnvelope) -> Result<(), SyncSinkError> {
+        self.accepted.push(item);
         Ok(())
     }
 }
@@ -40,6 +42,13 @@ fn envelope(id: u8) -> Envelope {
         Ok(envelope) => envelope,
         Err(_) => panic!("public sync Envelope should be valid"),
     }
+}
+
+fn transferred(id: u8) -> TransferredEnvelope {
+    let route = RouteGrant::try_new(300, 1, 16)
+        .unwrap_or_else(|_| panic!("public sync route should be valid"));
+    TransferredEnvelope::try_new(envelope(id), route)
+        .unwrap_or_else(|_| panic!("public sync transfer should be valid"))
 }
 
 #[test]
@@ -74,7 +83,7 @@ fn two_public_lan_sessions_offer_request_and_transfer_one_envelope() {
         Err(_) => panic!("sync sender should connect"),
     };
     let session = BoundedSession::new(connection, SessionLimits::default());
-    let offered = envelope(0x21);
+    let offered = transferred(0x21);
     let sent = send_batch(session, std::slice::from_ref(&offered));
     let Ok((_session, sent_summary)) = sent else {
         panic!("public sync sender should complete one batch");

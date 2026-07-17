@@ -36,6 +36,7 @@ pub enum SyncError {
     IdentifiersNotCanonical,
     EnvelopeRejected,
     EnvelopeIdentifierMismatch,
+    InvalidRouteGrant,
     TooManyOfferedEnvelopes,
     DuplicateOfferedEnvelope,
     UnexpectedFrame,
@@ -61,6 +62,7 @@ impl fmt::Display for SyncError {
             Self::EnvelopeIdentifierMismatch => {
                 formatter.write_str("transferred Envelope identifier does not match")
             }
+            Self::InvalidRouteGrant => formatter.write_str("invalid sync route grant"),
             Self::TooManyOfferedEnvelopes => {
                 formatter.write_str("sync offer exceeds the batch limit")
             }

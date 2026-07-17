@@ -450,7 +450,9 @@ version = "0.1.0"
 dependencies = [
  "lantern-core",
  "lantern-diagnostics",
+ "lantern-lan",
  "lantern-storage",
+ "lantern-sync",
  "lantern-time",
  "lantern-transport",
 ]

@@ -10,6 +10,7 @@
 mod error;
 mod exchange;
 mod frame;
+mod route;
 
 pub use error::{SyncError, SyncSinkError};
 pub use exchange::{EnvelopeSink, SyncSummary, receive_batch, send_batch};
@@ -17,3 +18,4 @@ pub use frame::{
     MAX_OFFERED_IDS, MAX_TRANSFER_ENVELOPE_BYTES, SYNC_PROTOCOL_VERSION, SyncFrame,
     decode_sync_frame, encode_sync_frame,
 };
+pub use route::{RouteGrant, TransferredEnvelope};

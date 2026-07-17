@@ -8,14 +8,15 @@ use std::{
 };
 
 use lantern_core::{
-    ContainerState, EnqueueOutcome, Envelope, EnvelopeQueue, LocalRouteRecord, QueueEffects,
-    QueueLimits,
+    ContainerState, DeduplicationStatus, EnqueueOutcome, Envelope, EnvelopeQueue, LocalRouteRecord,
+    MessageId, QueueEffects, QueueLimits,
 };
 use lantern_diagnostics::{
     DiagnosticEvent, EventCode, EventOutcome, JournalLimits, JournalMaintenance, JournalView,
     PersistentDiagnosticRecovery, SizeBucket,
 };
 use lantern_storage::{ClockRecovery, RecoveryReport, SqliteQueueStore};
+use lantern_sync::{EnvelopeSink, SyncSinkError, SyncSummary, TransferredEnvelope, receive_batch};
 use lantern_time::{ClockStatus, SystemRuntimeClock};
 use lantern_transport::{BoundedSession, FrameTransport, SessionLimits};
 
@@ -306,6 +307,22 @@ impl<C: NodeClock> NodeRuntime<C> {
         Ok(BoundedSession::new(transport, limits))
     }
 
+    pub fn receive_sync_batch<T: FrameTransport>(
+        &mut self,
+        session: BoundedSession<T>,
+    ) -> Result<(BoundedSession<T>, SyncSummary), NodeError> {
+        self.observe_and_persist()?;
+        let mut sink = NodeSyncSink {
+            runtime: self,
+            internal_error: None,
+        };
+        let result = receive_batch(session, &mut sink);
+        if let Some(error) = sink.internal_error {
+            return Err(error);
+        }
+        result.map_err(NodeError::from)
+    }
+
     pub fn stop(&mut self) -> Result<NodeMaintenance, NodeError> {
         let mut maintenance = self.observe_and_persist()?;
         if let Err(error) = self.record_event_with_report(
@@ -350,6 +367,49 @@ impl<C: NodeClock> NodeRuntime<C> {
             }
         }
         Ok(maintenance)
+    }
+
+    fn accept_transferred(
+        &mut self,
+        item: TransferredEnvelope,
+    ) -> Result<EnqueueOutcome, NodeError> {
+        let (now, mut maintenance) = self.observe_time()?;
+        let (envelope, grant) = item.into_parts();
+        let route = match LocalRouteRecord::from_received(
+            &envelope,
+            now,
+            u64::from(grant.remaining_ttl_seconds()),
+            u64::from(grant.hops_taken()),
+            u64::from(grant.copies_left()),
+        ) {
+            Ok(route) => route,
+            Err(error) => return self.fail(error.into()),
+        };
+        let result = match self.queue.enqueue(envelope, route, now) {
+            Ok(result) => result,
+            Err(error) => return self.fail(error.into()),
+        };
+        let outcome = result.outcome();
+        maintenance.include_queue_effects(result.effects());
+        if let Err(error) = self.store.save(&self.queue, now) {
+            return self.fail(error.into());
+        }
+
+        let (code, event_outcome) = match outcome {
+            EnqueueOutcome::Stored => (EventCode::EnvelopeAccepted, EventOutcome::Success),
+            EnqueueOutcome::DuplicateActive | EnqueueOutcome::DuplicateTombstone => {
+                (EventCode::DuplicateIgnored, EventOutcome::Duplicate)
+            }
+            EnqueueOutcome::Expired => (EventCode::EnvelopeRejected, EventOutcome::Expired),
+            EnqueueOutcome::ItemExceedsByteQuota => {
+                (EventCode::EnvelopeRejected, EventOutcome::QuotaReached)
+            }
+        };
+        if let Err(error) = self.record_event_with_report(code, event_outcome, 1, &mut maintenance)
+        {
+            return self.fail(error);
+        }
+        Ok(outcome)
     }
 
     fn observe_time(&mut self) -> Result<(u64, NodeMaintenance), NodeError> {
@@ -429,6 +489,38 @@ impl<C: NodeClock> NodeRuntime<C> {
         self.profile_lock = None;
         self.diagnostic_lock = None;
         Err(error)
+    }
+}
+
+struct NodeSyncSink<'runtime, C> {
+    runtime: &'runtime mut NodeRuntime<C>,
+    internal_error: Option<NodeError>,
+}
+
+impl<C: NodeClock> EnvelopeSink for NodeSyncSink<'_, C> {
+    fn wants(&mut self, message_id: MessageId) -> Result<bool, SyncSinkError> {
+        self.runtime
+            .ensure_running()
+            .map_err(|_| SyncSinkError::Unavailable)?;
+        Ok(matches!(
+            self.runtime
+                .queue
+                .deduplication_status(message_id, self.runtime.last_wall_seconds),
+            DeduplicationStatus::Unknown
+        ))
+    }
+
+    fn accept(&mut self, item: TransferredEnvelope) -> Result<(), SyncSinkError> {
+        match self.runtime.accept_transferred(item) {
+            Ok(EnqueueOutcome::Stored)
+            | Ok(EnqueueOutcome::DuplicateActive | EnqueueOutcome::DuplicateTombstone) => Ok(()),
+            Ok(EnqueueOutcome::ItemExceedsByteQuota) => Err(SyncSinkError::ResourceExhausted),
+            Ok(EnqueueOutcome::Expired) => Err(SyncSinkError::Rejected),
+            Err(error) => {
+                self.internal_error = Some(error);
+                Err(SyncSinkError::Unavailable)
+            }
+        }
     }
 }
 

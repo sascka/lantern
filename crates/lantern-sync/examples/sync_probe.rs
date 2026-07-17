@@ -5,7 +5,9 @@ use std::{env, ffi::OsString, io::Write, process::ExitCode};
 
 use lantern_core::{Envelope, MESSAGE_ID_LENGTH, MessageId, NORMAL_PRIORITY, PROTOCOL_VERSION};
 use lantern_lan::{BindAddress, LanListener, PeerAddress, connect};
-use lantern_sync::{EnvelopeSink, SyncSinkError, receive_batch, send_batch};
+use lantern_sync::{
+    EnvelopeSink, RouteGrant, SyncSinkError, TransferredEnvelope, receive_batch, send_batch,
+};
 use lantern_transport::{BoundedSession, SessionLimits};
 
 const USAGE: &[u8] =
@@ -51,7 +53,9 @@ fn run(mut arguments: impl Iterator<Item = OsString>) -> Result<(), ()> {
             let connection = connect(address).map_err(|_| ())?;
             let session = BoundedSession::new(connection, SessionLimits::default());
             let envelope = synthetic_envelope()?;
-            let (_session, summary) = send_batch(session, &[envelope]).map_err(|_| ())?;
+            let route = RouteGrant::try_new(300, 1, 16).map_err(|_| ())?;
+            let item = TransferredEnvelope::try_new(envelope, route).map_err(|_| ())?;
+            let (_session, summary) = send_batch(session, &[item]).map_err(|_| ())?;
             if summary.transferred() != 1 {
                 return Err(());
             }
@@ -84,8 +88,8 @@ impl EnvelopeSink for ProbeSink {
         Ok(self.accepted == 0)
     }
 
-    fn accept(&mut self, envelope: Envelope) -> Result<(), SyncSinkError> {
-        if envelope.protected_payload().as_bytes() != PAYLOAD || self.accepted != 0 {
+    fn accept(&mut self, item: TransferredEnvelope) -> Result<(), SyncSinkError> {
+        if item.envelope().protected_payload().as_bytes() != PAYLOAD || self.accepted != 0 {
             return Err(SyncSinkError::Rejected);
         }
         self.accepted = 1;

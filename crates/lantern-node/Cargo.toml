@@ -17,5 +17,9 @@ workspace = true
 lantern-core = { path = "../lantern-core" }
 lantern-diagnostics = { path = "../lantern-diagnostics", features = ["persistence"] }
 lantern-storage = { path = "../lantern-storage" }
+lantern-sync = { path = "../lantern-sync" }
 lantern-time = { path = "../lantern-time" }
 lantern-transport = { path = "../lantern-transport" }
+
+[dev-dependencies]
+lantern-lan = { path = "../lantern-lan" }

@@ -5,6 +5,7 @@ use core::fmt;
 use lantern_core::{CoreError, QueueError};
 use lantern_diagnostics::{DiagnosticError, PersistentDiagnosticError};
 use lantern_storage::StorageError;
+use lantern_sync::SyncError;
 use lantern_time::ClockError;
 
 use crate::ProfileLockError;
@@ -18,6 +19,7 @@ pub enum NodeError {
     Core(CoreError),
     Queue(QueueError),
     Storage(StorageError),
+    Sync(SyncError),
     Diagnostics(DiagnosticError),
     PersistentDiagnostics(PersistentDiagnosticError),
     ProfileLock(ProfileLockError),
@@ -34,6 +36,7 @@ impl fmt::Display for NodeError {
             Self::Core(error) => write!(formatter, "node rejected core data: {error}"),
             Self::Queue(error) => write!(formatter, "node queue failed: {error}"),
             Self::Storage(error) => write!(formatter, "node storage failed: {error}"),
+            Self::Sync(error) => write!(formatter, "node synchronization failed: {error}"),
             Self::Diagnostics(error) => {
                 write!(formatter, "node diagnostics failed: {error}")
             }
@@ -68,6 +71,12 @@ impl From<QueueError> for NodeError {
 impl From<StorageError> for NodeError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<SyncError> for NodeError {
+    fn from(error: SyncError) -> Self {
+        Self::Sync(error)
     }
 }
 

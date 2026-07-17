@@ -3,17 +3,19 @@
 use core::fmt;
 
 use lantern_core::{
-    Envelope, MAX_ENVELOPE_SIZE, MESSAGE_ID_LENGTH, MessageId, decode_envelope, encode_envelope,
+    MAX_ENVELOPE_SIZE, MESSAGE_ID_LENGTH, MessageId, decode_envelope, encode_envelope,
 };
 use lantern_transport::MAX_FRAME_BYTES;
 
-use crate::SyncError;
+use crate::{RouteGrant, SyncError, TransferredEnvelope};
 
 pub const SYNC_PROTOCOL_VERSION: u8 = 1;
 pub const MAX_OFFERED_IDS: usize = 32;
 
 const HEADER_BYTES: usize = 4;
-const TRANSFER_HEADER_BYTES: usize = HEADER_BYTES + MESSAGE_ID_LENGTH;
+const TRANSFER_ROUTE_BYTES: usize = 6;
+const TRANSFER_ID_END: usize = HEADER_BYTES + MESSAGE_ID_LENGTH;
+const TRANSFER_HEADER_BYTES: usize = TRANSFER_ID_END + TRANSFER_ROUTE_BYTES;
 pub const MAX_TRANSFER_ENVELOPE_BYTES: usize = MAX_FRAME_BYTES - TRANSFER_HEADER_BYTES;
 
 const OFFER_TYPE: u8 = 1;
@@ -25,7 +27,7 @@ const DONE_TYPE: u8 = 4;
 pub enum SyncFrame {
     Offer(Box<[MessageId]>),
     Request(Box<[MessageId]>),
-    Transfer(Envelope),
+    Transfer(TransferredEnvelope),
     Done,
 }
 
@@ -40,8 +42,8 @@ impl SyncFrame {
         Ok(Self::Request(identifiers.into_boxed_slice()))
     }
 
-    pub fn transfer(envelope: Envelope) -> Self {
-        Self::Transfer(envelope)
+    pub fn transfer(item: TransferredEnvelope) -> Self {
+        Self::Transfer(item)
     }
 
     pub const fn done() -> Self {
@@ -55,7 +57,7 @@ impl SyncFrame {
         }
     }
 
-    pub const fn transferred_envelope(&self) -> Option<&Envelope> {
+    pub const fn transferred_envelope(&self) -> Option<&TransferredEnvelope> {
         match self {
             Self::Transfer(envelope) => Some(envelope),
             Self::Offer(_) | Self::Request(_) | Self::Done => None,
@@ -157,8 +159,9 @@ fn decode_identifiers(input: &[u8], offer: bool) -> Result<SyncFrame, SyncError>
     }
 }
 
-pub(crate) fn encode_transfer_envelope(envelope: &Envelope) -> Result<Vec<u8>, SyncError> {
-    let encoded_envelope = encode_envelope(envelope).map_err(|_| SyncError::EnvelopeRejected)?;
+pub(crate) fn encode_transfer_envelope(item: &TransferredEnvelope) -> Result<Vec<u8>, SyncError> {
+    let encoded_envelope =
+        encode_envelope(item.envelope()).map_err(|_| SyncError::EnvelopeRejected)?;
     if encoded_envelope.len() > MAX_TRANSFER_ENVELOPE_BYTES {
         return Err(SyncError::FrameTooLarge);
     }
@@ -167,7 +170,10 @@ pub(crate) fn encode_transfer_envelope(envelope: &Envelope) -> Result<Vec<u8>, S
         .ok_or(SyncError::FrameTooLarge)?;
     let mut encoded = Vec::with_capacity(capacity);
     encoded.extend_from_slice(&[SYNC_PROTOCOL_VERSION, TRANSFER_TYPE, 0, 0]);
-    encoded.extend_from_slice(envelope.message_id().as_bytes());
+    encoded.extend_from_slice(item.message_id().as_bytes());
+    encoded.extend_from_slice(&item.route().remaining_ttl_seconds().to_be_bytes());
+    encoded.push(item.route().hops_taken());
+    encoded.push(item.route().copies_left());
     encoded.extend_from_slice(&encoded_envelope);
     Ok(encoded)
 }
@@ -179,15 +185,25 @@ fn decode_transfer(input: &[u8]) -> Result<SyncFrame, SyncError> {
     if input.len() - TRANSFER_HEADER_BYTES > MAX_ENVELOPE_SIZE {
         return Err(SyncError::FrameTooLarge);
     }
-    let id_bytes = <[u8; MESSAGE_ID_LENGTH]>::try_from(&input[HEADER_BYTES..TRANSFER_HEADER_BYTES])
+    let id_bytes = <[u8; MESSAGE_ID_LENGTH]>::try_from(&input[HEADER_BYTES..TRANSFER_ID_END])
         .map_err(|_| SyncError::InvalidFrameLength)?;
     let expected_id = MessageId::from_bytes(id_bytes);
+    let remaining_ttl_seconds = u32::from_be_bytes([
+        input[TRANSFER_ID_END],
+        input[TRANSFER_ID_END + 1],
+        input[TRANSFER_ID_END + 2],
+        input[TRANSFER_ID_END + 3],
+    ]);
+    let hops_taken = input[TRANSFER_ID_END + 4];
+    let copies_left = input[TRANSFER_ID_END + 5];
+    let route = RouteGrant::try_new(remaining_ttl_seconds, hops_taken, copies_left)?;
     let envelope = decode_envelope(&input[TRANSFER_HEADER_BYTES..])
         .map_err(|_| SyncError::EnvelopeRejected)?;
     if envelope.message_id() != expected_id {
         return Err(SyncError::EnvelopeIdentifierMismatch);
     }
-    Ok(SyncFrame::Transfer(envelope))
+    let item = TransferredEnvelope::try_new(envelope, route)?;
+    Ok(SyncFrame::Transfer(item))
 }
 
 fn validate_identifiers(identifiers: &[MessageId]) -> Result<(), SyncError> {
@@ -203,7 +219,7 @@ fn validate_identifiers(identifiers: &[MessageId]) -> Result<(), SyncError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lantern_core::{MAX_PROTECTED_PAYLOAD_SIZE, NORMAL_PRIORITY, PROTOCOL_VERSION};
+    use lantern_core::{Envelope, MAX_PROTECTED_PAYLOAD_SIZE, NORMAL_PRIORITY, PROTOCOL_VERSION};
 
     fn envelope(id: u8) -> Envelope {
         match Envelope::try_from_fields(
@@ -218,6 +234,13 @@ mod tests {
             Ok(envelope) => envelope,
             Err(_) => panic!("sync test Envelope should be valid"),
         }
+    }
+
+    fn transferred(id: u8) -> TransferredEnvelope {
+        let route = RouteGrant::try_new(300, 1, 16)
+            .unwrap_or_else(|_| panic!("sync test route should be valid"));
+        TransferredEnvelope::try_new(envelope(id), route)
+            .unwrap_or_else(|_| panic!("sync test transfer should be valid"))
     }
 
     #[test]
@@ -243,16 +266,20 @@ mod tests {
         );
         assert_eq!(encode_sync_frame(&SyncFrame::Done), Ok(vec![1, 4, 0, 0]));
 
-        let transfer = SyncFrame::transfer(envelope(0x31));
+        let transfer = SyncFrame::transfer(transferred(0x31));
         let encoded = encode_sync_frame(&transfer);
         let Ok(encoded) = encoded else {
             panic!("transfer should encode");
         };
+        assert_eq!(
+            &encoded[TRANSFER_ID_END..TRANSFER_HEADER_BYTES],
+            &[0, 0, 1, 44, 1, 16]
+        );
         let decoded = decode_sync_frame(&encoded);
         let Ok(SyncFrame::Transfer(decoded)) = decoded else {
             panic!("transfer should decode");
         };
-        assert_eq!(decoded, envelope(0x31));
+        assert_eq!(decoded, transferred(0x31));
     }
 
     #[test]
@@ -297,7 +324,7 @@ mod tests {
             Err(SyncError::InvalidFrameLength)
         );
 
-        let transfer = SyncFrame::transfer(envelope(0x41));
+        let transfer = SyncFrame::transfer(transferred(0x41));
         let encoded = encode_sync_frame(&transfer);
         let Ok(mut encoded) = encoded else {
             panic!("transfer should encode");
@@ -317,7 +344,7 @@ mod tests {
             panic!("one identifier should form an offer");
         };
         assert!(!format!("{offer:?}").contains(marker));
-        assert!(!format!("{:?}", SyncFrame::transfer(envelope(0x55))).contains("SYNTHETIC"));
+        assert!(!format!("{:?}", SyncFrame::transfer(transferred(0x55))).contains("SYNTHETIC"));
     }
 
     #[test]
@@ -328,7 +355,7 @@ mod tests {
                     .unwrap_or_else(|_| panic!("offer fixture should be valid")),
             )
             .unwrap_or_else(|_| panic!("offer fixture should encode")),
-            encode_sync_frame(&SyncFrame::transfer(envelope(0x21)))
+            encode_sync_frame(&SyncFrame::transfer(transferred(0x21)))
                 .unwrap_or_else(|_| panic!("transfer fixture should encode")),
             encode_sync_frame(&SyncFrame::done())
                 .unwrap_or_else(|_| panic!("done fixture should encode")),
@@ -366,8 +393,42 @@ mod tests {
             vec![0x73; MAX_PROTECTED_PAYLOAD_SIZE],
         )
         .unwrap_or_else(|_| panic!("maximum Envelope should be valid"));
+        let maximum = TransferredEnvelope::try_new(
+            maximum,
+            RouteGrant::try_new(300, 1, 16)
+                .unwrap_or_else(|_| panic!("maximum transfer route should be valid")),
+        )
+        .unwrap_or_else(|_| panic!("maximum transfer should be valid"));
         let encoded_transfer = encode_sync_frame(&SyncFrame::transfer(maximum))
             .unwrap_or_else(|_| panic!("maximum transfer should encode"));
         assert!(encoded_transfer.len() <= MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn invalid_route_grant_bytes_are_rejected_before_envelope_use() {
+        let encoded = encode_sync_frame(&SyncFrame::transfer(transferred(0x61)))
+            .unwrap_or_else(|_| panic!("transfer fixture should encode"));
+        let route_start = HEADER_BYTES + MESSAGE_ID_LENGTH;
+
+        let mut zero_ttl = encoded.clone();
+        zero_ttl[route_start..route_start + 4].fill(0);
+        assert_eq!(
+            decode_sync_frame(&zero_ttl),
+            Err(SyncError::InvalidRouteGrant)
+        );
+
+        let mut zero_hops = encoded.clone();
+        zero_hops[route_start + 4] = 0;
+        assert_eq!(
+            decode_sync_frame(&zero_hops),
+            Err(SyncError::InvalidRouteGrant)
+        );
+
+        let mut zero_copies = encoded;
+        zero_copies[route_start + 5] = 0;
+        assert_eq!(
+            decode_sync_frame(&zero_copies),
+            Err(SyncError::InvalidRouteGrant)
+        );
     }
 }

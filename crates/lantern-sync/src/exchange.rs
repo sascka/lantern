@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use lantern_core::{Envelope, MessageId};
+use lantern_core::MessageId;
 use lantern_transport::{BoundedSession, FrameTransport, MAX_FRAME_BYTES};
 
 use crate::frame::encode_transfer_envelope;
 use crate::{
-    MAX_OFFERED_IDS, SyncError, SyncFrame, SyncSinkError, decode_sync_frame, encode_sync_frame,
+    MAX_OFFERED_IDS, SyncError, SyncFrame, SyncSinkError, TransferredEnvelope, decode_sync_frame,
+    encode_sync_frame,
 };
 
 pub trait EnvelopeSink {
     fn wants(&mut self, message_id: MessageId) -> Result<bool, SyncSinkError>;
-    fn accept(&mut self, envelope: Envelope) -> Result<(), SyncSinkError>;
+    fn accept(&mut self, item: TransferredEnvelope) -> Result<(), SyncSinkError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,7 +37,7 @@ impl SyncSummary {
 
 pub fn send_batch<T: FrameTransport>(
     mut session: BoundedSession<T>,
-    offered: &[Envelope],
+    offered: &[TransferredEnvelope],
 ) -> Result<(BoundedSession<T>, SyncSummary), SyncError> {
     let sorted = sorted_offers(offered)?;
     let identifiers = sorted
@@ -50,11 +51,11 @@ pub fn send_batch<T: FrameTransport>(
         return Err(SyncError::UnexpectedFrame);
     };
     for requested_id in &requested {
-        let envelope = sorted
+        let item = sorted
             .iter()
-            .find(|envelope| envelope.message_id() == *requested_id)
+            .find(|item| item.message_id() == *requested_id)
             .ok_or(SyncError::RequestNotOffered)?;
-        let encoded = encode_transfer_envelope(envelope)?;
+        let encoded = encode_transfer_envelope(item)?;
         session.send_frame(&encoded)?;
     }
     send_frame(&mut session, &SyncFrame::done())?;
@@ -88,13 +89,13 @@ pub fn receive_batch<T: FrameTransport, S: EnvelopeSink>(
 
     for expected_id in &requested {
         let transfer = receive_frame(&mut session)?;
-        let SyncFrame::Transfer(envelope) = transfer else {
+        let SyncFrame::Transfer(item) = transfer else {
             return Err(SyncError::UnexpectedFrame);
         };
-        if envelope.message_id() != *expected_id {
+        if item.message_id() != *expected_id {
             return Err(SyncError::TransferNotRequested);
         }
-        sink.accept(envelope)?;
+        sink.accept(item)?;
     }
 
     if !matches!(receive_frame(&mut session)?, SyncFrame::Done) {
@@ -130,12 +131,12 @@ fn receive_frame<T: FrameTransport>(
     decode_sync_frame(frame)
 }
 
-fn sorted_offers(offered: &[Envelope]) -> Result<Vec<&Envelope>, SyncError> {
+fn sorted_offers(offered: &[TransferredEnvelope]) -> Result<Vec<&TransferredEnvelope>, SyncError> {
     if offered.len() > MAX_OFFERED_IDS {
         return Err(SyncError::TooManyOfferedEnvelopes);
     }
     let mut sorted = offered.iter().collect::<Vec<_>>();
-    sorted.sort_by_key(|envelope| envelope.message_id());
+    sorted.sort_by_key(|item| item.message_id());
     if sorted
         .windows(2)
         .any(|pair| pair[0].message_id() == pair[1].message_id())
@@ -153,7 +154,7 @@ fn count_u8(count: usize) -> Result<u8, SyncError> {
 mod tests {
     use std::collections::VecDeque;
 
-    use lantern_core::{MESSAGE_ID_LENGTH, NORMAL_PRIORITY, PROTOCOL_VERSION};
+    use lantern_core::{Envelope, MESSAGE_ID_LENGTH, NORMAL_PRIORITY, PROTOCOL_VERSION};
     use lantern_transport::{FrameReceive, SessionLimits, TransportFailureKind};
 
     use super::*;
@@ -200,6 +201,13 @@ mod tests {
         }
     }
 
+    fn transferred(id: u8) -> TransferredEnvelope {
+        let route = crate::RouteGrant::try_new(300, 1, 16)
+            .unwrap_or_else(|_| panic!("exchange route fixture should be valid"));
+        TransferredEnvelope::try_new(envelope(id), route)
+            .unwrap_or_else(|_| panic!("exchange transfer fixture should be valid"))
+    }
+
     fn encoded(frame: &SyncFrame) -> Vec<u8> {
         encode_sync_frame(frame).unwrap_or_else(|_| panic!("sync frame fixture should encode"))
     }
@@ -207,7 +215,7 @@ mod tests {
     #[derive(Default)]
     struct TestSink {
         known: Vec<MessageId>,
-        accepted: Vec<Envelope>,
+        accepted: Vec<TransferredEnvelope>,
     }
 
     impl EnvelopeSink for TestSink {
@@ -215,8 +223,8 @@ mod tests {
             Ok(!self.known.contains(&message_id))
         }
 
-        fn accept(&mut self, envelope: Envelope) -> Result<(), SyncSinkError> {
-            self.accepted.push(envelope);
+        fn accept(&mut self, item: TransferredEnvelope) -> Result<(), SyncSinkError> {
+            self.accepted.push(item);
             Ok(())
         }
     }
@@ -237,15 +245,15 @@ mod tests {
         };
         let session = BoundedSession::new(transport, SessionLimits::default());
         assert!(matches!(
-            send_batch(session, &[envelope(0x11)]),
+            send_batch(session, &[transferred(0x11)]),
             Err(SyncError::RequestNotOffered)
         ));
     }
 
     #[test]
     fn sender_canonicalizes_offer_and_follows_request_order() {
-        let first = envelope(0x11);
-        let second = envelope(0x22);
+        let first = transferred(0x11);
+        let second = transferred(0x22);
         let request = SyncFrame::request(vec![second.message_id()])
             .unwrap_or_else(|_| panic!("request fixture should be valid"));
         let transport = MemoryTransport {
@@ -272,7 +280,7 @@ mod tests {
     fn duplicate_local_offer_is_rejected_before_transport_use() {
         let session = BoundedSession::new(MemoryTransport::default(), SessionLimits::default());
         assert!(matches!(
-            send_batch(session, &[envelope(0x11), envelope(0x11)]),
+            send_batch(session, &[transferred(0x11), transferred(0x11)]),
             Err(SyncError::DuplicateOfferedEnvelope)
         ));
     }
@@ -312,7 +320,7 @@ mod tests {
         let requested_id = MessageId::from_bytes([0x41; MESSAGE_ID_LENGTH]);
         let offer = SyncFrame::offer(vec![requested_id])
             .unwrap_or_else(|_| panic!("offer fixture should be valid"));
-        let wrong_transfer = SyncFrame::transfer(envelope(0x42));
+        let wrong_transfer = SyncFrame::transfer(transferred(0x42));
         let transport = MemoryTransport {
             incoming: VecDeque::from([encoded(&offer), encoded(&wrong_transfer)]),
             sent: Vec::new(),
