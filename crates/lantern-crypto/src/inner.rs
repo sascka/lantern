@@ -502,3 +502,180 @@ fn decode_fixed<const LENGTH: usize>(
     <[u8; LENGTH]>::try_from(bytes).map_err(|_| CryptoError::WrongLength)
 }
 
+#[cfg(test)]
+mod tests {
+    use lantern_core::Envelope;
+
+    use super::{
+        CommonFields, ConfirmFields, Content, HintFields, InnerMessage, decode_inner_message,
+        encode_inner_message,
+    };
+    use crate::{CryptoError, OlmMessageType};
+
+    fn common(hint: [u8; 16], service: bool) -> CommonFields {
+        let result = CommonFields::try_new(
+            [0x11; 16],
+            hint,
+            if service { 604_800 } else { 60 },
+            if service { 2 } else { 1 },
+        );
+        let Ok(result) = result else {
+            panic!("test common fields were rejected");
+        };
+        result
+    }
+
+    fn confirm() -> ConfirmFields {
+        ConfirmFields::new([0x33; 16], [0x44; 16], [0x55; 32], [0x66; 32])
+    }
+
+    fn hint() -> HintFields {
+        let result = HintFields::try_new(1, [0x77; 16]);
+        let Ok(result) = result else {
+            panic!("test hint fields were rejected");
+        };
+        result
+    }
+
+    fn message(content: Content) -> InnerMessage {
+        let is_chat = matches!(content, Content::ChatMessage(_));
+        let recipient_hint = if matches!(content, Content::HintFinal(_)) {
+            [0x77; 16]
+        } else {
+            [0x22; 16]
+        };
+        let result = InnerMessage::try_new(common(recipient_hint, !is_chat), content);
+        let Ok(result) = result else {
+            panic!("test inner message was rejected");
+        };
+        result
+    }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        use core::fmt::Write as _;
+
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            assert!(write!(output, "{byte:02x}").is_ok());
+        }
+        output
+    }
+
+    #[test]
+    fn all_seven_types_have_fixed_canonical_vectors() {
+        let chat = Content::chat("hello".to_owned());
+        let Ok(chat) = chat else {
+            panic!("test chat was rejected");
+        };
+        let messages = [
+            message(chat),
+            message(Content::ContactInitiatorConfirm(confirm())),
+            message(Content::ContactReceiverConfirm(confirm())),
+            message(Content::HintProposal(hint())),
+            message(Content::HintAccepted(hint())),
+            message(Content::HintCommitted(hint())),
+            message(Content::HintFinal(hint())),
+        ];
+        let encoded = messages
+            .iter()
+            .map(|value| encode_inner_message(value).map(|bytes| to_hex(&bytes)))
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(encoded) = encoded else {
+            panic!("test vectors could not be encoded");
+        };
+        assert_eq!(
+            encoded,
+            [
+                "aa000101000201030104501111111111111111111111111111111105502222222222222222222222222222222206183c07010800096568656c6c6f",
+                "ad0001010102010301045011111111111111111111111111111111055022222222222222222222222222222222061a00093a80070208000950333333333333333333333333333333330a50444444444444444444444444444444440b582055555555555555555555555555555555555555555555555555555555555555550c58206666666666666666666666666666666666666666666666666666666666666666",
+                "ad0001010202010301045011111111111111111111111111111111055022222222222222222222222222222222061a00093a80070208000950333333333333333333333333333333330a50444444444444444444444444444444440b582055555555555555555555555555555555555555555555555555555555555555550c58206666666666666666666666666666666666666666666666666666666666666666",
+                "ab0001010302010301045011111111111111111111111111111111055022222222222222222222222222222222061a00093a800702080009010a5077777777777777777777777777777777",
+                "ab0001010402010301045011111111111111111111111111111111055022222222222222222222222222222222061a00093a800702080009010a5077777777777777777777777777777777",
+                "ab0001010502010301045011111111111111111111111111111111055022222222222222222222222222222222061a00093a800702080009010a5077777777777777777777777777777777",
+                "ab0001010602010301045011111111111111111111111111111111055077777777777777777777777777777777061a00093a800702080009010a5077777777777777777777777777777777",
+            ]
+        );
+
+        for value in messages {
+            let bytes = encode_inner_message(&value);
+            let Ok(bytes) = bytes else {
+                panic!("test vector could not be encoded");
+            };
+            assert_eq!(decode_inner_message(&bytes), Ok(value));
+        }
+    }
+
+    #[test]
+    fn text_limits_controls_and_service_parameters_are_enforced() {
+        assert!(Content::chat("a".repeat(4096)).is_ok());
+        assert_eq!(
+            Content::chat("a".repeat(4097)),
+            Err(CryptoError::InvalidValue)
+        );
+        for text in ["", "line\nfeed", "tab\there", "nul\0here", "escape\u{1b}"] {
+            assert_eq!(
+                Content::chat(text.to_owned()),
+                Err(CryptoError::InvalidValue)
+            );
+        }
+
+        let invalid =
+            InnerMessage::try_new(common([0x22; 16], false), Content::HintProposal(hint()));
+        assert_eq!(invalid, Err(CryptoError::InvalidValue));
+        let wrong_final =
+            InnerMessage::try_new(common([0x22; 16], true), Content::HintFinal(hint()));
+        assert_eq!(wrong_final, Err(CryptoError::InvalidValue));
+    }
+
+    #[test]
+    fn olm_type_and_envelope_copies_are_checked() {
+        let initiator = message(Content::ContactInitiatorConfirm(confirm()));
+        assert!(initiator.validate_olm_type(OlmMessageType::PreKey).is_ok());
+        assert_eq!(
+            initiator.validate_olm_type(OlmMessageType::Normal),
+            Err(CryptoError::UnsupportedType)
+        );
+        let chat = Content::chat("hello".to_owned());
+        let Ok(chat) = chat else {
+            panic!("test chat was rejected");
+        };
+        let chat = message(chat);
+        assert_eq!(
+            chat.validate_olm_type(OlmMessageType::PreKey),
+            Err(CryptoError::UnsupportedType)
+        );
+
+        let envelope = Envelope::try_from_fields(1, [0x11; 16], [0x22; 16], 60, 1, 0, vec![1]);
+        let Ok(envelope) = envelope else {
+            panic!("test envelope was rejected");
+        };
+        assert!(chat.matches_envelope(&envelope));
+        let changed = Envelope::try_from_fields(1, [0x12; 16], [0x22; 16], 60, 1, 0, vec![1]);
+        let Ok(changed) = changed else {
+            panic!("changed test envelope was rejected");
+        };
+        assert!(!chat.matches_envelope(&changed));
+    }
+
+    #[test]
+    fn every_truncated_prefix_and_noncanonical_integer_is_rejected() {
+        let chat = Content::chat("hello".to_owned());
+        let Ok(chat) = chat else {
+            panic!("test chat was rejected");
+        };
+        let encoded = encode_inner_message(&message(chat));
+        let Ok(encoded) = encoded else {
+            panic!("test message could not be encoded");
+        };
+        for length in 0..encoded.len() {
+            assert!(decode_inner_message(&encoded[..length]).is_err());
+        }
+
+        let mut noncanonical = encoded;
+        noncanonical.splice(1..2, [0x18, 0x00]);
+        assert_eq!(
+            decode_inner_message(&noncanonical),
+            Err(CryptoError::NonCanonical)
+        );
+    }
+}

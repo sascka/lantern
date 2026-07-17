@@ -269,3 +269,102 @@ fn random_array<const LENGTH: usize>() -> Result<[u8; LENGTH], CryptoError> {
     Ok(bytes)
 }
 
+#[cfg(test)]
+mod tests {
+    use lantern_core::Envelope;
+    use vodozemac::olm::{Account, AccountPickle};
+
+    use super::{
+        accept_initiator_confirmation, accept_receiver_confirmation, build_initiator_confirmation,
+    };
+    use crate::{ContactResponse, Invitation};
+
+    const PICKLE_KEY: [u8; 32] = [0x91; 32];
+
+    #[test]
+    fn two_qr_sas_and_both_encrypted_confirmations_establish_one_session() {
+        let mut alice_account = Account::new();
+        let bob_account = Account::new();
+        let invitation = Invitation::create(&mut alice_account);
+        let Ok((invitation, alice_sas)) = invitation else {
+            panic!("test invitation could not be created");
+        };
+        let response = ContactResponse::create(&bob_account, &invitation);
+        let Ok((response, bob_sas)) = response else {
+            panic!("test response could not be created");
+        };
+        let alice_display = alice_sas.finish(&invitation, &response);
+        let bob_display = bob_sas.finish(&invitation, &response);
+        assert!(matches!((alice_display, bob_display), (Ok(left), Ok(right)) if left == right));
+
+        let initiator = build_initiator_confirmation(&bob_account, &invitation, &response);
+        let Ok(initiator) = initiator else {
+            panic!("test initiator confirmation could not be created");
+        };
+        assert_eq!(initiator.envelope().ttl_seconds().get(), 604_800);
+        assert_eq!(initiator.envelope().max_hops().get(), 2);
+        assert_eq!(
+            initiator.envelope().recipient_hint().as_bytes(),
+            invitation.inbound_recipient_hint()
+        );
+        let (bob_session, initiator_envelope) = initiator.into_parts();
+
+        let account_pickle = alice_account.pickle().encrypt(&PICKLE_KEY);
+        let changed = Envelope::try_from_fields(
+            initiator_envelope.protocol_version(),
+            [0xfe; 16],
+            *initiator_envelope.recipient_hint().as_bytes(),
+            u64::from(initiator_envelope.ttl_seconds().get()),
+            u64::from(initiator_envelope.max_hops().get()),
+            initiator_envelope.priority().as_raw(),
+            initiator_envelope.protected_payload().as_bytes().to_vec(),
+        );
+        let Ok(changed) = changed else {
+            panic!("changed confirmation was rejected by core");
+        };
+        let candidate =
+            AccountPickle::from_encrypted(&account_pickle, &PICKLE_KEY).map(Account::from_pickle);
+        let Ok(candidate) = candidate else {
+            panic!("test account candidate could not be restored");
+        };
+        assert!(
+            accept_initiator_confirmation(candidate, &invitation, &response, &changed).is_err()
+        );
+
+        let candidate =
+            AccountPickle::from_encrypted(&account_pickle, &PICKLE_KEY).map(Account::from_pickle);
+        let Ok(candidate) = candidate else {
+            panic!("test account candidate could not be restored after rejection");
+        };
+        let accepted =
+            accept_initiator_confirmation(candidate, &invitation, &response, &initiator_envelope);
+        let Ok(accepted) = accepted else {
+            panic!("valid initiator confirmation was rejected");
+        };
+        assert_eq!(
+            accepted.receiver_confirmation().recipient_hint().as_bytes(),
+            response.inbound_recipient_hint()
+        );
+        let (_, mut alice_session, receiver_envelope) = accepted.into_parts();
+        let bob_session =
+            accept_receiver_confirmation(bob_session, &invitation, &response, &receiver_envelope);
+        let Ok(mut bob_session) = bob_session else {
+            panic!("valid receiver confirmation was rejected");
+        };
+        assert_eq!(alice_session.session_id(), bob_session.session_id());
+
+        let mut messages = Vec::new();
+        for index in 0..32 {
+            let text = format!("post-confirmation-{index}");
+            let encrypted = alice_session.encrypt(text.as_bytes());
+            let Ok(encrypted) = encrypted else {
+                panic!("post-confirmation message could not be encrypted");
+            };
+            messages.push((text, encrypted));
+        }
+        for (text, encrypted) in messages.iter().rev() {
+            let decrypted = bob_session.decrypt(encrypted);
+            assert!(decrypted.is_ok_and(|value| value == text.as_bytes()));
+        }
+    }
+}

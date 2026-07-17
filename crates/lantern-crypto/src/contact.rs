@@ -626,3 +626,126 @@ fn encoding_error<T>(_error: T) -> CryptoError {
     CryptoError::Malformed
 }
 
+#[cfg(test)]
+mod tests {
+    use vodozemac::olm::Account;
+
+    use super::{
+        ContactBundle, ContactResponse, Invitation, decode_contact_qr, encode_invitation_qr,
+        encode_response_qr, identity_fingerprint,
+    };
+
+    fn exchange() -> (
+        Invitation,
+        super::SasHandle,
+        ContactResponse,
+        super::SasHandle,
+    ) {
+        let mut alice = Account::new();
+        let bob = Account::new();
+        let invitation = Invitation::create(&mut alice);
+        let Ok((invitation, alice_sas)) = invitation else {
+            panic!("test invitation could not be created");
+        };
+        let response = ContactResponse::create(&bob, &invitation);
+        let Ok((response, bob_sas)) = response else {
+            panic!("test response could not be created");
+        };
+        (invitation, alice_sas, response, bob_sas)
+    }
+
+    #[test]
+    fn signed_bundles_have_the_specified_exact_sizes_and_round_trip() {
+        let (invitation, _, response, _) = exchange();
+        let invitation_cbor = invitation.encode_signed();
+        let response_cbor = response.encode_signed();
+        let Ok(invitation_cbor) = invitation_cbor else {
+            panic!("test invitation could not be encoded");
+        };
+        let Ok(response_cbor) = response_cbor else {
+            panic!("test response could not be encoded");
+        };
+        assert_eq!(invitation_cbor.len(), 292);
+        assert_eq!(response_cbor.len(), 272);
+
+        let invitation_qr = encode_invitation_qr(&invitation);
+        let response_qr = encode_response_qr(&response);
+        let Ok(invitation_qr) = invitation_qr else {
+            panic!("test invitation QR could not be encoded");
+        };
+        let Ok(response_qr) = response_qr else {
+            panic!("test response QR could not be encoded");
+        };
+        assert_eq!(invitation_qr.len(), 409);
+        assert_eq!(response_qr.len(), 382);
+        assert!(matches!(
+            decode_contact_qr(&invitation_qr),
+            Ok(ContactBundle::Invitation(value)) if value == invitation
+        ));
+        assert!(matches!(
+            decode_contact_qr(&response_qr),
+            Ok(ContactBundle::Response(value)) if value == response
+        ));
+    }
+
+    #[test]
+    fn both_sides_derive_the_same_sas_from_both_signed_bundles() {
+        let (invitation, alice_sas, response, bob_sas) = exchange();
+        let alice = alice_sas.finish(&invitation, &response);
+        let bob = bob_sas.finish(&invitation, &response);
+        let Ok(alice) = alice else {
+            panic!("Alice could not derive the test SAS");
+        };
+        let Ok(bob) = bob else {
+            panic!("Bob could not derive the test SAS");
+        };
+        assert_eq!(alice, bob);
+        assert!(alice.emoji_indices().iter().all(|value| *value < 64));
+        let decimals = alice.decimals();
+        assert!((1000..=9191).contains(&decimals.0));
+        assert!((1000..=9191).contains(&decimals.1));
+        assert!((1000..=9191).contains(&decimals.2));
+    }
+
+    #[test]
+    fn changed_signature_and_noncanonical_qr_are_rejected() {
+        let (invitation, _, _, _) = exchange();
+        let qr = encode_invitation_qr(&invitation);
+        let Ok(qr) = qr else {
+            panic!("test invitation QR could not be encoded");
+        };
+        let mut changed = qr.into_bytes();
+        let Some(last) = changed.last_mut() else {
+            panic!("test invitation QR was empty");
+        };
+        *last = if *last == b'A' { b'B' } else { b'A' };
+        let changed = String::from_utf8(changed);
+        let Ok(changed) = changed else {
+            panic!("changed QR was no longer ASCII");
+        };
+        assert!(decode_contact_qr(&changed).is_err());
+        assert!(decode_contact_qr(&(changed + "=")).is_err());
+    }
+
+    #[test]
+    fn debug_output_does_not_disclose_bundle_fields() {
+        let (invitation, alice_sas, response, _) = exchange();
+        let marker = invitation.invitation_secret;
+        let marker = format!("{marker:?}");
+        assert!(!format!("{invitation:?}").contains(&marker));
+        assert!(!format!("{response:?}").contains(&marker));
+        assert!(!format!("{alice_sas:?}").contains(&marker));
+    }
+
+    #[test]
+    fn permanent_identity_fingerprint_is_unpadded_grouped_base32() {
+        assert_eq!(
+            identity_fingerprint(&[0; 32]),
+            "L1-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA"
+        );
+        let fingerprint = identity_fingerprint(&[0xff; 32]);
+        assert_eq!(fingerprint.len(), 67);
+        assert!(!fingerprint.contains('='));
+        assert!(fingerprint.starts_with("L1-"));
+    }
+}
