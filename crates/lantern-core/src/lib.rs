@@ -24,7 +24,7 @@ pub use queue::{
     DeduplicationStatus, EnqueueOutcome, EnqueueResult, EnvelopeQueue, QueueEffects, QueueEntry,
     QueueError, QueueField, QueueLimits, TombstoneEntry,
 };
-pub use route::{ContainerState, LocalRouteRecord};
+pub use route::{ContainerState, ForwardingReservation, LocalRouteRecord};
 
 /// Only protocol version accepted by the v0.1 domain model.
 pub const PROTOCOL_VERSION: u64 = 1;

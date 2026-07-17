@@ -4,8 +4,8 @@ use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    CborError, ContainerState, Envelope, LocalRouteRecord, MAX_QUEUE_BYTES, MAX_QUEUE_ENTRIES,
-    MAX_TOMBSTONE_RETENTION_SECONDS, MAX_TOMBSTONES, MIN_TTL_SECONDS, MessageId,
+    CborError, ContainerState, Envelope, ForwardingReservation, LocalRouteRecord, MAX_QUEUE_BYTES,
+    MAX_QUEUE_ENTRIES, MAX_TOMBSTONE_RETENTION_SECONDS, MAX_TOMBSTONES, MIN_TTL_SECONDS, MessageId,
     encoded_envelope_size,
 };
 
@@ -389,6 +389,20 @@ impl EnvelopeQueue {
 
     pub fn entries(&self) -> impl Iterator<Item = &QueueEntry> {
         self.entries.values()
+    }
+
+    pub fn reserve_forward(
+        &mut self,
+        message_id: MessageId,
+        at: u64,
+    ) -> Result<Option<ForwardingReservation>, QueueError> {
+        let Some(entry) = self.entries.get_mut(&message_id) else {
+            return Ok(None);
+        };
+        entry
+            .route
+            .reserve_forward(&entry.envelope, at)
+            .map_err(|_| QueueError::InvariantViolation)
     }
 
     pub fn tombstones(&self) -> impl Iterator<Item = &TombstoneEntry> {

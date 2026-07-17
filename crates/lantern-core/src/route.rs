@@ -39,6 +39,41 @@ pub struct LocalRouteRecord {
     state: ContainerState,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ForwardingReservation {
+    remaining_ttl: u32,
+    hops_taken: u8,
+    receiver_copies: u8,
+    sender_copies: u8,
+}
+
+impl fmt::Debug for ForwardingReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ForwardingReservation")
+            .field("values", &"redacted")
+            .finish()
+    }
+}
+
+impl ForwardingReservation {
+    pub const fn remaining_ttl(self) -> u32 {
+        self.remaining_ttl
+    }
+
+    pub const fn hops_taken(self) -> u8 {
+        self.hops_taken
+    }
+
+    pub const fn receiver_copies(self) -> u8 {
+        self.receiver_copies
+    }
+
+    pub const fn sender_copies(self) -> u8 {
+        self.sender_copies
+    }
+}
+
 impl fmt::Debug for LocalRouteRecord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -210,6 +245,59 @@ impl LocalRouteRecord {
         Ok(())
     }
 
+    pub(crate) fn reserve_forward(
+        &mut self,
+        envelope: &Envelope,
+        at: u64,
+    ) -> Result<Option<ForwardingReservation>, CoreError> {
+        if self.message_id != envelope.message_id() || self.state != ContainerState::Stored {
+            return Err(CoreError::InvalidStateTransition);
+        }
+        if at >= self.local_deadline
+            || self.hops_taken >= envelope.max_hops().get()
+            || self.copies_left <= 1
+        {
+            return Ok(None);
+        }
+
+        let remaining_ttl =
+            self.local_deadline
+                .checked_sub(at)
+                .ok_or(CoreError::ArithmeticOverflow {
+                    field: Field::RemainingTtl,
+                })?;
+        let remaining_ttl =
+            u32::try_from(remaining_ttl).map_err(|_| CoreError::ValueAboveMaximum {
+                field: Field::RemainingTtl,
+            })?;
+        let hops_taken = self
+            .hops_taken
+            .checked_add(1)
+            .ok_or(CoreError::ArithmeticOverflow {
+                field: Field::HopsTaken,
+            })?;
+        let receiver_copies = self.copies_left / 2;
+        let sender_copies =
+            self.copies_left
+                .checked_sub(receiver_copies)
+                .ok_or(CoreError::ArithmeticOverflow {
+                    field: Field::CopiesLeft,
+                })?;
+        if receiver_copies == 0 || sender_copies == 0 {
+            return Err(CoreError::ValueBelowMinimum {
+                field: Field::CopiesLeft,
+            });
+        }
+
+        self.copies_left = sender_copies;
+        Ok(Some(ForwardingReservation {
+            remaining_ttl,
+            hops_taken,
+            receiver_copies,
+            sender_copies,
+        }))
+    }
+
     pub const fn message_id(&self) -> MessageId {
         self.message_id
     }
@@ -285,6 +373,50 @@ mod tests {
         assert_eq!(u64::from(record.remaining_ttl()), MAX_TTL_SECONDS);
         assert_eq!(record.hops_taken(), 16);
         assert_eq!(record.copies_left(), INITIAL_COPY_BUDGET);
+    }
+
+    #[test]
+    fn forwarding_reservation_splits_budget_and_uses_local_remaining_time() {
+        let envelope = test_envelope();
+        let mut route = LocalRouteRecord::from_received(&envelope, 100, 300, 1, 5)
+            .unwrap_or_else(|_| panic!("forwarding route fixture should be valid"));
+
+        let reservation = route
+            .reserve_forward(&envelope, 150)
+            .unwrap_or_else(|_| panic!("forwarding reservation should not fail"))
+            .unwrap_or_else(|| panic!("forwarding reservation should be available"));
+
+        assert_eq!(reservation.remaining_ttl(), 250);
+        assert_eq!(reservation.hops_taken(), 2);
+        assert_eq!(reservation.receiver_copies(), 2);
+        assert_eq!(reservation.sender_copies(), 3);
+        assert_eq!(route.copies_left(), 3);
+        assert!(!format!("{reservation:?}").contains("250"));
+    }
+
+    #[test]
+    fn wait_expired_and_hop_limited_routes_do_not_spend_budget() {
+        let envelope = test_envelope();
+        let mut wait = LocalRouteRecord::from_received(&envelope, 100, 300, 1, 1)
+            .unwrap_or_else(|_| panic!("wait route fixture should be valid"));
+        assert_eq!(wait.reserve_forward(&envelope, 150), Ok(None));
+        assert_eq!(wait.copies_left(), 1);
+
+        let mut expired = LocalRouteRecord::from_received(&envelope, 100, 60, 1, 8)
+            .unwrap_or_else(|_| panic!("expired route fixture should be valid"));
+        assert_eq!(expired.reserve_forward(&envelope, 160), Ok(None));
+        assert_eq!(expired.copies_left(), 8);
+
+        let mut hop_limited = LocalRouteRecord::from_received(
+            &envelope,
+            100,
+            300,
+            envelope.max_hops().get().into(),
+            8,
+        )
+        .unwrap_or_else(|_| panic!("hop-limited route fixture should be valid"));
+        assert_eq!(hop_limited.reserve_forward(&envelope, 150), Ok(None));
+        assert_eq!(hop_limited.copies_left(), 8);
     }
 
     #[test]
