@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MPL-2.0
+
+[package]
+name = "lantern-secret-storage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Password KDF boundary for Lantern secret storage"
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+argon2 = { version = "=0.5.3", default-features = false, features = ["zeroize"] }
+getrandom = { version = "=0.4.3", default-features = false }
+libc = { version = "=0.2.186", default-features = false }
+minicbor = { version = "=2.2.2", default-features = false, features = ["alloc"] }
+zeroize = { version = "=1.9.0", default-features = false }
