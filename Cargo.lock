@@ -44,6 +44,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lantern-diagnostics"
+version = "0.1.0"
+
+[[package]]
 name = "lantern-storage"
 version = "0.1.0"
 dependencies = [

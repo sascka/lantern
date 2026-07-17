@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MPL-2.0
+
+[package]
+name = "lantern-diagnostics"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded metadata-minimizing diagnostics for Lantern"
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
