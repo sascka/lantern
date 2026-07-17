@@ -34,6 +34,47 @@
 | `typenum` | 1.20.1 | `MIT` из `MIT OR Apache-2.0` | Copyright (c) 2014 Paho Lurie-Gregg |
 | `zeroize` | 1.9.0 | `MIT` из `Apache-2.0 OR MIT` | Copyright (c) 2018-2026 The RustCrypto Project Developers |
 
+### Криптографическое дерево
+
+После закрытия криптографического рубежа runtime-дерево дополнено следующими
+пакетами. Точные checksums и зависимости находятся в `Cargo.lock`.
+
+| Пакет | Версия | Выбранная лицензия |
+| --- | --- | --- |
+| `vodozemac` | 0.10.0 | `Apache-2.0` |
+| `matrix-pickle`, `matrix-pickle-derive` | 0.2.3 | `Apache-2.0` |
+| `prost`, `prost-derive` | 0.14.4 | `Apache-2.0` |
+| `base64` | 0.22.1 | `MIT` из `MIT OR Apache-2.0` |
+| `aes` | 0.8.4 | `MIT` из `MIT OR Apache-2.0` |
+| `aead` | 0.5.2 | `MIT` из `MIT OR Apache-2.0` |
+| `cbc` | 0.1.2 | `MIT` из `MIT OR Apache-2.0` |
+| `chacha20` | 0.9.1 | `MIT` из `Apache-2.0 OR MIT` |
+| `chacha20poly1305` | 0.10.1 | `MIT` из `Apache-2.0 OR MIT` |
+| `cipher` | 0.4.4 | `MIT` из `MIT OR Apache-2.0` |
+| `poly1305` | 0.8.0 | `MIT` из `Apache-2.0 OR MIT` |
+| `universal-hash` | 0.5.1 | `MIT` из `MIT OR Apache-2.0` |
+| `hkdf` | 0.12.4 | `MIT` из `MIT OR Apache-2.0` |
+| `hmac` | 0.12.1 | `MIT` из `MIT OR Apache-2.0` |
+| `sha2` | 0.10.9 | `MIT` из `MIT OR Apache-2.0` |
+| `curve25519-dalek` | 4.1.3 | `BSD-3-Clause` |
+| `curve25519-dalek-derive` | 0.1.1 | `MIT` из `MIT OR Apache-2.0` |
+| `ed25519-dalek` | 2.2.0 | `BSD-3-Clause` |
+| `ed25519` | 2.2.3 | `MIT` из `Apache-2.0 OR MIT` |
+| `x25519-dalek` | 2.0.1 | `BSD-3-Clause` |
+| `signature` | 2.2.0 | `MIT` из `Apache-2.0 OR MIT` |
+| `rand`, `rand_chacha` | 0.8.7, 0.3.1 | `MIT` из `MIT OR Apache-2.0` |
+| `rand_core` | 0.6.4 | `MIT` из `MIT OR Apache-2.0` |
+| `getrandom` | 0.2.17 | `MIT` из `MIT OR Apache-2.0` |
+| `arrayvec` | 0.7.8 | `MIT` из `MIT OR Apache-2.0` |
+| `bytes` | 1.12.1 | `MIT` |
+| `serde`, `serde_bytes`, `serde_json` | 1.0.228, 0.11.19, 1.0.150 | `MIT` из dual license |
+| `thiserror`, `thiserror-impl` | 2.0.18 | `MIT` из `MIT OR Apache-2.0` |
+
+Полный Apache-2.0 сохранён в
+[`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt). BSD-3-Clause имеет
+одинаковые условия, но copyright-уведомления сохраняются из соответствующих
+пакетов при распространении исходников.
+
 ## Зависимости сборки
 
 | Пакет | Версия | Выбранная лицензия | Copyright из пакета |
@@ -89,8 +130,11 @@ MIT со всеми нужными copyright-строками находится
 Текст BSD-3-Clause для `subtle` сохранён в
 [`LICENSES/BSD-3-Clause-subtle.txt`](LICENSES/BSD-3-Clause-subtle.txt).
 
-Bundled SQLite 3.53.2 включён в `libsqlite3-sys` 0.38.1. Авторы SQLite передали
-его в public domain. Официальное описание статуса:
+Bundled SQLCipher 4.17.0 на базе SQLite 3.53.3 включён через точный Git rev
+`libsqlite3-sys` 0.38.1. Код SQLCipher распространяется по BSD-3-Clause
+Zetetic, полный текст и copyright сохранены в
+[`LICENSES/BSD-3-Clause-SQLCipher.txt`](LICENSES/BSD-3-Clause-SQLCipher.txt).
+Основная часть SQLite передана в public domain. Официальное описание статуса:
 <https://www.sqlite.org/copyright.html>.
 
 Версии в этом документе должны совпадать с `Cargo.lock`. При обновлении любого

@@ -20,10 +20,10 @@ Lantern будет использовать несколько лицензий 
 | спецификация протокола | Creative Commons Attribution 4.0 | `CC-BY-4.0` |
 | остальные документы | Creative Commons Attribution-ShareAlike 4.0 | `CC-BY-SA-4.0` |
 
-В репозитории есть документы, исследовательский Python-симулятор и семь
+В репозитории есть документы, исследовательский Python-симулятор и восемь
 библиотечных crate: `lantern-core`, `lantern-diagnostics`, `lantern-storage`,
 `lantern-time`, `lantern-transport`, `lantern-node` и
-`lantern-secret-storage`. Для них лицензии указаны через SPDX-комментарии в
+`lantern-secret-storage`, `lantern-crypto`. Для них лицензии указаны через SPDX-комментарии в
 начале файлов. Лицензия будущих приложений начнёт
 действовать, когда появятся соответствующие файлы с лицензионными уведомлениями.
 
@@ -32,11 +32,13 @@ Lantern будет использовать несколько лицензий 
 | Зависимость | Версия | Features | Транзитивные зависимости | Лицензия |
 | --- | --- | --- | --- | --- |
 | `minicbor` | `2.2.2` | только `alloc` | нет | `BlueOak-1.0.0` |
-| `rusqlite` | `0.40.1` | `bundled`, `limits` | 10 пакетов | `MIT` |
+| `rusqlite` | `0.40.1` | `bundled`, `bundled-sqlcipher`, `limits` | общее native-дерево workspace | `MIT` |
 | `argon2` | `0.5.3` | `zeroize` | 10 пакетов | `MIT` из `MIT OR Apache-2.0` |
+| `vodozemac` | `0.10.0` | нет | расширенное runtime-дерево crypto | `Apache-2.0` |
+| `base64` | `0.22.1` | только `alloc` | нет | `MIT` из `MIT OR Apache-2.0` |
 | `getrandom` | `0.4.3` | нет | 2 пакета для Linux | `MIT` из `MIT OR Apache-2.0` |
 | `libc` | `0.2.186` | нет | нет | `MIT` из `MIT OR Apache-2.0` |
-| `zeroize` | `1.9.0` | нет | нет | `MIT` из `MIT OR Apache-2.0` |
+| `zeroize` | `1.9.0` | только `alloc` | proc-macro при включённом `argon2/zeroize` | `MIT` из `MIT OR Apache-2.0` |
 | `proptest` | `1.11.0` | только `std`, dev-зависимость | 21 пакет в `Cargo.lock` | `MIT` |
 
 Версии зафиксированы точно в `Cargo.toml` и `Cargo.lock`. Default features у
@@ -45,12 +47,15 @@ Lantern будет использовать несколько лицензий 
 - `minicbor`: <https://github.com/twittner/minicbor>;
 - `rusqlite`: <https://github.com/rusqlite/rusqlite>;
 - `argon2`: <https://github.com/RustCrypto/password-hashes/tree/master/argon2>;
+- `vodozemac`: <https://github.com/matrix-org/vodozemac>;
+- `base64`: <https://github.com/marshallpierce/rust-base64>;
 - `getrandom`: <https://github.com/rust-random/getrandom>;
 - `libc`: <https://github.com/rust-lang/libc>;
 - `zeroize`: <https://github.com/RustCrypto/utils>;
 - `proptest`: <https://github.com/proptest-rs/proptest>.
 
-`rusqlite` собирает bundled SQLite 3.53.2 через `libsqlite3-sys` 0.38.1. Полное
+`rusqlite` собирает bundled SQLCipher 4.17.0 на базе SQLite 3.53.3 через точный
+Git rev `libsqlite3-sys` 0.38.1. Полное
 дерево, версии, выбранные варианты MIT и copyright-уведомления сохранены в
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). SQLite находится в public
 domain согласно официальному уведомлению проекта.
@@ -197,7 +202,9 @@ SPDX-License-Identifier: CC-BY-SA-4.0
 - CC BY-SA 4.0: <https://creativecommons.org/licenses/by-sa/4.0/legalcode>
 - Blue Oak Model License 1.0.0: <https://blueoakcouncil.org/license/1.0.0>
 - MIT License: <https://opensource.org/license/mit>
+- Apache License 2.0: <https://www.apache.org/licenses/LICENSE-2.0>
 - BSD-3-Clause из `subtle`: <https://github.com/dalek-cryptography/subtle/blob/2.6.1/LICENSE>
+- BSD-3-Clause из SQLCipher: <https://github.com/sqlcipher/sqlcipher/blob/v4.17.0/LICENSE>
 - Unicode License v3: <https://www.unicode.org/license.txt>
 - статус SQLite: <https://www.sqlite.org/copyright.html>
 
@@ -214,8 +221,10 @@ SPDX-License-Identifier: CC-BY-SA-4.0
 | `LICENSES/CC-BY-4.0.txt` | `9ba9550ad48438d0836ddab3da480b3b69ffa0aac7b7878b5a0039e7ab429411` |
 | `LICENSES/CC-BY-SA-4.0.txt` | `28a9529c7d0bb4dc51f4bf5c116a3d16ef247a052f7591466768ddf563fd1cf5` |
 | `LICENSES/BlueOak-1.0.0.txt` | `8a1af140fdfbf5afd3df27f7e662f989c5b963a300020dfafce42033cae9e004` |
+| `LICENSES/Apache-2.0.txt` | `a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9` |
 | `LICENSES/MIT-third-party.txt` | `374b80371455f1d259fb372c441b282417ecb042e70b522e28c294402604ea0e` |
 | `LICENSES/BSD-3-Clause-subtle.txt` | `9cdc9c19be2d06bfafcd0b08045d4c0d1e0c1a5a9ab22cf4d76de14845af64c5` |
+| `LICENSES/BSD-3-Clause-SQLCipher.txt` | `ea4fcb309f14a22065e1ea45362d494d320012249ed865fe9c7c0946db754131` |
 | `LICENSES/Unicode-3.0.txt` | `f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1` |
 
 Хеши позволяют проверить, что юридические тексты не были случайно изменены при
@@ -231,8 +240,8 @@ SPDX-License-Identifier: CC-BY-SA-4.0
   видимого конфликта с MPL 2.0, но это не является заключением юриста.
 - Dev-дерево `proptest` увеличивает объём проверки лицензий, даже хотя не входит
   в обычную сборку Lantern.
-- Совместимость будущих криптографических, сетевых и других зависимостей ещё не
-  проверена.
+- Лицензии текущих прямых криптографических зависимостей проверены, но дерево
+  нужно проверять заново при каждом обновлении.
 - Документы не проходили проверку юристом.
 - Название и логотип Lantern потребуют отдельной политики, если станут товарным
   знаком.
