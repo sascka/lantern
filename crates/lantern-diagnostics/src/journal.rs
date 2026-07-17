@@ -345,3 +345,179 @@ impl fmt::Debug for DiagnosticJournal {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits(max_records: usize, max_bytes: usize, retention: u64) -> JournalLimits {
+        let result = JournalLimits::try_new(max_records, max_bytes, retention);
+        let Ok(limits) = result else {
+            panic!("valid diagnostic limits were rejected");
+        };
+        limits
+    }
+
+    fn event(code: EventCode) -> DiagnosticEvent {
+        let result = DiagnosticEvent::try_new(code, EventOutcome::Success, 1, None, None);
+        let Ok(event) = result else {
+            panic!("valid diagnostic event was rejected");
+        };
+        event
+    }
+
+    #[test]
+    fn limits_reject_zero_and_protocol_excess() {
+        assert_eq!(
+            JournalLimits::try_new(0, DIAGNOSTIC_RECORD_LOGICAL_BYTES, 60),
+            Err(DiagnosticError::InvalidRecordLimit)
+        );
+        assert_eq!(
+            JournalLimits::try_new(MAX_JOURNAL_RECORDS + 1, DIAGNOSTIC_RECORD_LOGICAL_BYTES, 60,),
+            Err(DiagnosticError::InvalidRecordLimit)
+        );
+        assert_eq!(
+            JournalLimits::try_new(1, DIAGNOSTIC_RECORD_LOGICAL_BYTES - 1, 60),
+            Err(DiagnosticError::InvalidByteLimit)
+        );
+        assert_eq!(
+            JournalLimits::try_new(1, MAX_JOURNAL_LOGICAL_BYTES + 1, 60),
+            Err(DiagnosticError::InvalidByteLimit)
+        );
+        assert_eq!(
+            JournalLimits::try_new(1, DIAGNOSTIC_RECORD_LOGICAL_BYTES, 59),
+            Err(DiagnosticError::InvalidRetention)
+        );
+    }
+
+    #[test]
+    fn records_keep_only_safe_order_and_categories() {
+        let mut journal = DiagnosticJournal::new(limits(3, 96, 60));
+        let first = journal.record(event(EventCode::NodeStarted), 100);
+        let second = journal.record(event(EventCode::StorageOpened), 101);
+        let (Ok(first), Ok(second)) = (first, second) else {
+            panic!("valid diagnostic events could not be recorded");
+        };
+        assert_eq!(first.record().sequence(), 1);
+        assert_eq!(second.record().sequence(), 2);
+        assert_eq!(journal.len(), 2);
+        assert_eq!(journal.logical_bytes(), 64);
+        let view = journal.view(101);
+        assert_eq!(
+            view.records()
+                .map(|record| record.code())
+                .collect::<Vec<_>>(),
+            vec![EventCode::NodeStarted, EventCode::StorageOpened]
+        );
+    }
+
+    #[test]
+    fn record_and_byte_quotas_evict_oldest() {
+        let mut journal = DiagnosticJournal::new(limits(3, 64, 60));
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        assert!(journal.record(event(EventCode::StorageOpened), 101).is_ok());
+        let result = journal.record(event(EventCode::QueueRecovered), 102);
+        let Ok(result) = result else {
+            panic!("quota maintenance failed");
+        };
+        assert_eq!(result.maintenance().evicted_records(), 1);
+        assert_eq!(journal.len(), 2);
+        assert_eq!(journal.logical_bytes(), 64);
+        let view = journal.view(102);
+        assert_eq!(
+            view.records().next().map(|record| record.code()),
+            Some(EventCode::StorageOpened)
+        );
+    }
+
+    #[test]
+    fn retention_expires_at_exact_boundary() {
+        let mut journal = DiagnosticJournal::new(limits(3, 96, 60));
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        assert_eq!(journal.maintain(159).expired_records(), 0);
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal.maintain(160).expired_records(), 1);
+        assert!(journal.is_empty());
+    }
+
+    #[test]
+    fn clock_rollback_clears_records_without_resetting_sequence() {
+        let mut journal = DiagnosticJournal::new(limits(3, 96, 60));
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        assert!(journal.record(event(EventCode::StorageOpened), 110).is_ok());
+        let result = journal.record(event(EventCode::ClockRollbackDetected), 90);
+        let Ok(result) = result else {
+            panic!("clock rollback handling failed");
+        };
+        assert_eq!(result.maintenance().rollback_cleared_records(), 2);
+        assert!(result.maintenance().clock_rollback_detected());
+        assert_eq!(result.record().sequence(), 3);
+        assert_eq!(journal.len(), 1);
+    }
+
+    #[test]
+    fn empty_journal_still_reports_clock_rollback() {
+        let mut journal = DiagnosticJournal::new(limits(3, 96, 60));
+        assert_eq!(journal.maintain(100), JournalMaintenance::default());
+        let maintenance = journal.maintain(99);
+        assert!(maintenance.clock_rollback_detected());
+        assert_eq!(maintenance.rollback_cleared_records(), 0);
+    }
+
+    #[test]
+    fn overflow_leaves_existing_records_unchanged() {
+        let mut journal = DiagnosticJournal::new(limits(2, 64, 60));
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        assert_eq!(
+            journal.record(event(EventCode::QueueSaved), u64::MAX),
+            Err(DiagnosticError::ArithmeticOverflow)
+        );
+        assert_eq!(journal.len(), 1);
+        let view = journal.view(100);
+        assert_eq!(
+            view.records().next().map(|record| record.sequence()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn explicit_clear_returns_only_a_count() {
+        let mut journal = DiagnosticJournal::new(limits(2, 64, 60));
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        assert_eq!(journal.clear(), 1);
+        assert_eq!(journal.clear(), 0);
+    }
+
+    #[test]
+    fn debug_redacts_internal_timing_and_has_no_event_contents() {
+        let mut journal = DiagnosticJournal::new(limits(2, 64, 60));
+        assert!(
+            journal
+                .record(event(EventCode::NodeStarted), 123_456_789)
+                .is_ok()
+        );
+        let output = format!("{journal:?}");
+        assert!(!output.contains("123456789"));
+        assert!(!output.contains("NodeStarted"));
+        assert!(output.contains("redacted"));
+    }
+
+    #[test]
+    fn deterministic_sequence_preserves_all_limits() {
+        let limits = limits(17, 13 * DIAGNOSTIC_RECORD_LOGICAL_BYTES, 300);
+        let mut journal = DiagnosticJournal::new(limits);
+        for step in 0..1_000_u64 {
+            let code = if step % 2 == 0 {
+                EventCode::EnvelopeAccepted
+            } else {
+                EventCode::DuplicateIgnored
+            };
+            assert!(journal.record(event(code), step).is_ok());
+            assert!(journal.len() <= limits.max_records());
+            assert!(journal.logical_bytes() <= limits.max_logical_bytes());
+            assert_eq!(
+                journal.logical_bytes(),
+                journal.len() * DIAGNOSTIC_RECORD_LOGICAL_BYTES
+            );
+        }
+    }
+}
