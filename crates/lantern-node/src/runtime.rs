@@ -358,3 +358,90 @@ impl<C> fmt::Debug for NodeRuntime<C> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lantern_core::{NORMAL_PRIORITY, PROTOCOL_VERSION};
+    use lantern_diagnostics::{DIAGNOSTIC_RECORD_LOGICAL_BYTES, DiagnosticEvent};
+
+    fn envelope(number: u8) -> Envelope {
+        let result = Envelope::try_from_fields(
+            PROTOCOL_VERSION,
+            [number; 16],
+            [0x22; 16],
+            60,
+            4,
+            NORMAL_PRIORITY,
+            vec![0x33; 32],
+        );
+        let Ok(envelope) = result else {
+            panic!("valid maintenance test Envelope was rejected");
+        };
+        envelope
+    }
+
+    fn route(envelope: &Envelope, now: u64) -> LocalRouteRecord {
+        let result = LocalRouteRecord::for_origin(envelope, now);
+        let Ok(route) = result else {
+            panic!("valid maintenance test route was rejected");
+        };
+        route
+    }
+
+    #[test]
+    fn maintenance_classifies_evicted_and_expired_entries() {
+        let limits = QueueLimits::try_new(1, 64 * 1024, 4, 60);
+        let Ok(limits) = limits else {
+            panic!("valid maintenance queue limits were rejected");
+        };
+        let mut queue = EnvelopeQueue::new(limits);
+        let first = envelope(0x11);
+        assert!(
+            queue
+                .enqueue(first.clone(), route(&first, 100), 100)
+                .is_ok()
+        );
+        let second = envelope(0x22);
+        let result = queue.enqueue(second.clone(), route(&second, 101), 101);
+        let Ok(result) = result else {
+            panic!("valid maintenance test enqueue failed");
+        };
+        let mut maintenance = NodeMaintenance::default();
+        maintenance.include_queue_effects(result.effects());
+        assert_eq!(maintenance.evicted_entries(), 1);
+        assert_eq!(maintenance.expired_entries(), 0);
+
+        let effects = queue.expire_due(161);
+        let Ok(effects) = effects else {
+            panic!("maintenance test expiration failed");
+        };
+        maintenance.include_queue_effects(&effects);
+        assert_eq!(maintenance.evicted_entries(), 1);
+        assert_eq!(maintenance.expired_entries(), 1);
+    }
+
+    #[test]
+    fn maintenance_accumulates_journal_expiration_and_eviction() {
+        let limits = JournalLimits::try_new(1, DIAGNOSTIC_RECORD_LOGICAL_BYTES, 60);
+        let Ok(limits) = limits else {
+            panic!("valid maintenance journal limits were rejected");
+        };
+        let event =
+            DiagnosticEvent::try_new(EventCode::NodeStarted, EventOutcome::Success, 1, None, None);
+        let Ok(event) = event else {
+            panic!("valid maintenance diagnostic event was rejected");
+        };
+        let mut journal = DiagnosticJournal::new(limits);
+        assert!(journal.record(event, 100).is_ok());
+        let second = journal.record(event, 101);
+        let Ok(second) = second else {
+            panic!("second maintenance diagnostic event was rejected");
+        };
+        let mut maintenance = NodeMaintenance::default();
+        maintenance.include_journal_maintenance(second.maintenance());
+        assert_eq!(maintenance.evicted_diagnostics(), 1);
+
+        maintenance.include_journal_maintenance(journal.maintain(161));
+        assert_eq!(maintenance.expired_diagnostics(), 1);
+    }
+}
