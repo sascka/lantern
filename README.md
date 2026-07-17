@@ -39,6 +39,9 @@ production и пока не разрешает передавать настоя
 Строгая Olm-оболочка, семь внутренних типов и правило кандидатного ratchet
 зафиксированы в [PAYLOAD.md](PAYLOAD.md) и
 [ADR 0015](docs/adr/0015-versioned-olm-payload-and-transactional-ratchet.md).
+Постоянные лимиты попыток decrypt зафиксированы в
+[CRYPTO_LIMITS.md](CRYPTO_LIMITS.md) и
+[ADR 0016](docs/adr/0016-persistent-crypto-attempt-limits.md).
 Исходные данные находятся в
 [обзоре криптографии](docs/research/CRYPTOGRAPHY_REVIEW.md) и
 [результатах эксперимента](experiments/vodozemac-compat/RESULTS.md).
@@ -102,14 +105,15 @@ Android, группы, карты, SOS, интернет-реле, Tor, BLE, Wi-
 6. [CONTACTS.md](CONTACTS.md) - контактные QR, SAS-проверка и смена
    `recipient_hint`.
 7. [PAYLOAD.md](PAYLOAD.md) - Olm-оболочка и внутренние сообщения.
-8. [PRIVACY.md](PRIVACY.md) - локальные данные, метаданные и сроки хранения.
-9. [SECURITY.md](SECURITY.md) - правила безопасной разработки и выпуска версий.
-10. [LICENSES.md](LICENSES.md) - лицензии разных частей проекта и правила для
+8. [CRYPTO_LIMITS.md](CRYPTO_LIMITS.md) - постоянные лимиты попыток decrypt.
+9. [PRIVACY.md](PRIVACY.md) - локальные данные, метаданные и сроки хранения.
+10. [SECURITY.md](SECURITY.md) - правила безопасной разработки и выпуска версий.
+11. [LICENSES.md](LICENSES.md) - лицензии разных частей проекта и правила для
    зависимостей.
-11. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) - версии и уведомления
+12. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) - версии и уведомления
    сторонних зависимостей.
-12. [CONTRIBUTING.md](CONTRIBUTING.md) - порядок внесения и проверки изменений.
-13. [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - правила общения и модерации.
+13. [CONTRIBUTING.md](CONTRIBUTING.md) - порядок внесения и проверки изменений.
+14. [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - правила общения и модерации.
 
 Если документы противоречат друг другу, работу нужно остановить и сначала
 исправить спецификацию. Нельзя молча выбирать более удобный вариант в коде.

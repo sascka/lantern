@@ -456,6 +456,12 @@ Compatibility-эксперимент завершён 17 июля 2026 года.
 предел защищённого payload 8 KiB и кандидатное состояние Account или Session
 до полной проверки Envelope. Реализация и тестовые векторы пока не добавлены.
 
+Постоянный лимит неудачных decrypt зафиксирован 17 июля 2026 года в
+`CRYPTO_LIMITS.md` и `docs/adr/0016-persistent-crypto-attempt-limits.md`.
+Выбраны связанные profile, contact и pending-contact token bucket,
+резервирование до decrypt и отсутствие offline refill после перезапуска.
+Limiter пока не реализован и зависит от будущего секретного хранилища.
+
 ## Этап 3 - два устройства в LAN
 
 Статус: `ожидает`.
