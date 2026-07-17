@@ -124,3 +124,171 @@ fn map_handshake_io(error: io::Error) -> LanError {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{LanListener, connect, encode_hello};
+    use crate::{BindAddress, LAN_PROTOCOL_VERSION, LanError, PeerAddress};
+    use core::time::Duration;
+    use std::{
+        io::{Read, Write},
+        net::{SocketAddr, TcpStream},
+        thread,
+    };
+
+    fn loopback_listener() -> LanListener {
+        let address: SocketAddr = match "127.0.0.1:0".parse() {
+            Ok(address) => address,
+            Err(_) => panic!("loopback test address should parse"),
+        };
+        let address = match BindAddress::try_new(address) {
+            Ok(address) => address,
+            Err(_) => panic!("loopback test address should be allowed"),
+        };
+        match LanListener::bind(address) {
+            Ok(listener) => listener,
+            Err(_) => panic!("loopback listener should bind"),
+        }
+    }
+
+    fn peer_address(listener: &LanListener) -> PeerAddress {
+        let address = match listener.local_address() {
+            Ok(address) => address.socket_addr(),
+            Err(_) => panic!("bound listener should have a local address"),
+        };
+        match PeerAddress::try_new(address) {
+            Ok(address) => address,
+            Err(_) => panic!("bound loopback address should be a peer address"),
+        }
+    }
+
+    #[test]
+    fn two_tcp_sides_negotiate_the_same_version() {
+        let listener = loopback_listener();
+        let peer = peer_address(&listener);
+        let server = thread::spawn(move || listener.accept());
+
+        let client = connect(peer);
+        let Ok(client) = client else {
+            panic!("client handshake should succeed");
+        };
+        let server = match server.join() {
+            Ok(result) => result,
+            Err(_) => panic!("server thread should not panic"),
+        };
+        let Ok(server) = server else {
+            panic!("server handshake should succeed");
+        };
+
+        assert_eq!(client.protocol_version(), LAN_PROTOCOL_VERSION);
+        assert_eq!(server.protocol_version(), LAN_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn fragmented_hello_is_read_without_allocating_a_body() {
+        let listener = loopback_listener();
+        let peer = peer_address(&listener);
+        let server = thread::spawn(move || listener.accept());
+
+        let mut raw = match TcpStream::connect(peer.socket_addr()) {
+            Ok(stream) => stream,
+            Err(_) => panic!("raw loopback client should connect"),
+        };
+        let mut server_hello = [0_u8; 8];
+        if raw.read_exact(&mut server_hello).is_err() {
+            panic!("raw client should receive the server hello");
+        }
+        for byte in encode_hello() {
+            if raw.write_all(&[byte]).is_err() {
+                panic!("fragmented test hello should be written");
+            }
+        }
+
+        let result = match server.join() {
+            Ok(result) => result,
+            Err(_) => panic!("server thread should not panic"),
+        };
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn unsupported_version_is_rejected_before_application_data() {
+        let listener = loopback_listener();
+        let peer = peer_address(&listener);
+        let server = thread::spawn(move || listener.accept());
+
+        let mut raw = match TcpStream::connect(peer.socket_addr()) {
+            Ok(stream) => stream,
+            Err(_) => panic!("raw loopback client should connect"),
+        };
+        let mut server_hello = [0_u8; 8];
+        if raw.read_exact(&mut server_hello).is_err() {
+            panic!("raw client should receive the server hello");
+        }
+        let mut unsupported = encode_hello();
+        unsupported[5] = LAN_PROTOCOL_VERSION + 1;
+        if raw.write_all(&unsupported).is_err() {
+            panic!("unsupported test hello should be written");
+        }
+
+        let result = match server.join() {
+            Ok(result) => result,
+            Err(_) => panic!("server thread should not panic"),
+        };
+        assert!(matches!(result, Err(LanError::UnsupportedVersion)));
+    }
+
+    #[test]
+    fn connection_closed_during_hello_is_rejected() {
+        let listener = loopback_listener();
+        let peer = peer_address(&listener);
+        let server = thread::spawn(move || listener.accept());
+
+        let mut raw = match TcpStream::connect(peer.socket_addr()) {
+            Ok(stream) => stream,
+            Err(_) => panic!("raw loopback client should connect"),
+        };
+        let mut server_hello = [0_u8; 8];
+        if raw.read_exact(&mut server_hello).is_err() {
+            panic!("raw client should receive the server hello");
+        }
+        if raw.write_all(&encode_hello()[..3]).is_err() {
+            panic!("partial test hello should be written");
+        }
+        if raw.shutdown(std::net::Shutdown::Write).is_err() {
+            panic!("raw client should close its write side");
+        }
+
+        let result = match server.join() {
+            Ok(result) => result,
+            Err(_) => panic!("server thread should not panic"),
+        };
+        assert!(matches!(result, Err(LanError::ConnectionClosed)));
+    }
+
+    #[test]
+    fn stalled_peer_is_stopped_by_the_handshake_timeout() {
+        let listener = loopback_listener();
+        let peer = peer_address(&listener);
+        let server = thread::spawn(move || listener.accept_with_timeout(Duration::from_millis(25)));
+
+        let _raw = match TcpStream::connect(peer.socket_addr()) {
+            Ok(stream) => stream,
+            Err(_) => panic!("raw loopback client should connect"),
+        };
+        let result = match server.join() {
+            Ok(result) => result,
+            Err(_) => panic!("server thread should not panic"),
+        };
+        assert!(matches!(result, Err(LanError::HandshakeTimedOut)));
+    }
+
+    #[test]
+    fn debug_output_contains_no_socket_addresses() {
+        let listener = loopback_listener();
+        let marker = match listener.local_address() {
+            Ok(address) => format!("{}", address.socket_addr()),
+            Err(_) => panic!("bound listener should have a local address"),
+        };
+        assert!(!format!("{listener:?}").contains(&marker));
+    }
+}

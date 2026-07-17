@@ -136,3 +136,72 @@ fn is_link_local_v6(address: Ipv6Addr) -> bool {
     address.segments()[0] & 0xffc0 == 0xfe80
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{AddressError, BindAddress, PeerAddress};
+    use core::str::FromStr;
+    use std::net::SocketAddr;
+
+    fn socket(value: &str) -> SocketAddr {
+        match value.parse() {
+            Ok(address) => address,
+            Err(_) => panic!("test socket address should be valid"),
+        }
+    }
+
+    #[test]
+    fn accepts_loopback_private_link_local_and_unique_local_addresses() {
+        for value in [
+            "127.0.0.1:38383",
+            "10.20.30.40:38383",
+            "169.254.20.1:38383",
+            "[::1]:38383",
+            "[fd12:3456::1]:38383",
+            "[fe80::1]:38383",
+        ] {
+            assert!(PeerAddress::from_str(value).is_ok(), "rejected {value}");
+        }
+    }
+
+    #[test]
+    fn rejects_public_multicast_wildcard_dns_and_missing_port() {
+        for value in [
+            "8.8.8.8:53",
+            "224.0.0.1:38383",
+            "0.0.0.0:38383",
+            "[::]:38383",
+            "example.com:38383",
+            "127.0.0.1:0",
+        ] {
+            assert!(PeerAddress::from_str(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn bind_allows_an_ephemeral_port_but_not_a_wildcard() {
+        assert!(BindAddress::try_new(socket("127.0.0.1:0")).is_ok());
+        assert_eq!(
+            BindAddress::try_new(socket("0.0.0.0:0")),
+            Err(AddressError::OutsideLan)
+        );
+    }
+
+    #[test]
+    fn text_input_is_bounded_before_parsing() {
+        assert_eq!(PeerAddress::from_str(""), Err(AddressError::Empty));
+        assert_eq!(
+            PeerAddress::from_str(&"1".repeat(65)),
+            Err(AddressError::TooLong)
+        );
+    }
+
+    #[test]
+    fn debug_output_does_not_disclose_the_address() {
+        let marker = "10.81.82.83:38383";
+        let address = PeerAddress::from_str(marker);
+        let Ok(address) = address else {
+            panic!("private test address should be accepted");
+        };
+        assert!(!format!("{address:?}").contains(marker));
+    }
+}

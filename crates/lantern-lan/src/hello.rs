@@ -36,3 +36,33 @@ pub(crate) fn decode_hello(bytes: [u8; HELLO_BYTES]) -> Result<(), LanError> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{LAN_PROTOCOL_VERSION, decode_hello, encode_hello};
+    use crate::LanError;
+
+    #[test]
+    fn hello_has_one_fixed_vector() {
+        assert_eq!(
+            encode_hello(),
+            [0x4c, 0x41, 0x4e, 0x54, 0x01, 0x01, 0x00, 0x00]
+        );
+        assert!(decode_hello(encode_hello()).is_ok());
+    }
+
+    #[test]
+    fn unsupported_version_has_a_separate_closed_error() {
+        let mut hello = encode_hello();
+        hello[5] = LAN_PROTOCOL_VERSION + 1;
+        assert_eq!(decode_hello(hello), Err(LanError::UnsupportedVersion));
+    }
+
+    #[test]
+    fn every_non_version_field_is_strict() {
+        for index in [0_usize, 1, 2, 3, 4, 6, 7] {
+            let mut hello = encode_hello();
+            hello[index] ^= 0x80;
+            assert_eq!(decode_hello(hello), Err(LanError::InvalidHello));
+        }
+    }
+}
