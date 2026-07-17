@@ -7,7 +7,7 @@ use std::{
 };
 
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
-use vodozemac::olm::{Session, SessionPickle};
+use vodozemac::olm::{Account, Session, SessionPickle};
 use zeroize::Zeroizing;
 
 use crate::{SecretStorageError, SecretStore, database::database_error};
@@ -61,6 +61,54 @@ pub struct NewContact {
     pub curve_identity_key: [u8; 32],
     pub inbound_recipient_hint: [u8; 16],
     pub outbound_recipient_hint: [u8; 16],
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ActiveContact {
+    contact_id: ContactId,
+    display_name: String,
+    signing_identity_key: [u8; 32],
+    curve_identity_key: [u8; 32],
+    inbound_recipient_hint: [u8; 16],
+    outbound_recipient_hint: [u8; 16],
+}
+
+impl ActiveContact {
+    pub const fn contact_id(&self) -> ContactId {
+        self.contact_id
+    }
+
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub const fn signing_identity_key(&self) -> &[u8; 32] {
+        &self.signing_identity_key
+    }
+
+    pub const fn curve_identity_key(&self) -> &[u8; 32] {
+        &self.curve_identity_key
+    }
+
+    pub const fn inbound_recipient_hint(&self) -> &[u8; 16] {
+        &self.inbound_recipient_hint
+    }
+
+    pub const fn outbound_recipient_hint(&self) -> &[u8; 16] {
+        &self.outbound_recipient_hint
+    }
+}
+
+impl fmt::Debug for ActiveContact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActiveContact")
+            .field("contact_id", &"redacted")
+            .field("display_name_length", &self.display_name.len())
+            .field("identity_keys", &"redacted")
+            .field("recipient_hints", &"redacted")
+            .finish()
+    }
 }
 
 impl fmt::Debug for NewContact {
@@ -119,6 +167,52 @@ impl LimiterRuntime {
 }
 
 impl SecretStore {
+    pub fn active_contact(
+        &self,
+        contact_id: ContactId,
+    ) -> Result<Option<ActiveContact>, SecretStorageError> {
+        type ContactRow = (String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+        let row: Option<ContactRow> = self
+            .connection
+            .query_row(
+                "SELECT display_name, signing_identity_key, curve_identity_key,
+                        inbound_current_hint, outbound_current_hint
+                 FROM contacts WHERE contact_id = ?1 AND state = 3",
+                params![contact_id.0.as_slice()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        let Some((display_name, signing_key, curve_key, inbound_hint, outbound_hint)) = row else {
+            return Ok(None);
+        };
+        validate_display_name(&display_name)?;
+        Ok(Some(ActiveContact {
+            contact_id,
+            display_name,
+            signing_identity_key: signing_key
+                .try_into()
+                .map_err(|_| SecretStorageError::CorruptStorage)?,
+            curve_identity_key: curve_key
+                .try_into()
+                .map_err(|_| SecretStorageError::CorruptStorage)?,
+            inbound_recipient_hint: inbound_hint
+                .try_into()
+                .map_err(|_| SecretStorageError::CorruptStorage)?,
+            outbound_recipient_hint: outbound_hint
+                .try_into()
+                .map_err(|_| SecretStorageError::CorruptStorage)?,
+        }))
+    }
+
     pub fn contact_for_inbound_hint(
         &self,
         recipient_hint: [u8; 16],
@@ -177,9 +271,35 @@ impl SecretStore {
         contact: NewContact,
         session: &Session,
     ) -> Result<(), SecretStorageError> {
+        self.commit_active_contact(contact, session, None)
+    }
+
+    pub fn add_active_contact_with_account(
+        &mut self,
+        contact: NewContact,
+        session: &Session,
+        account: &Account,
+    ) -> Result<(), SecretStorageError> {
+        self.commit_active_contact(contact, session, Some(account))
+    }
+
+    fn commit_active_contact(
+        &mut self,
+        contact: NewContact,
+        session: &Session,
+        account: Option<&Account>,
+    ) -> Result<(), SecretStorageError> {
         validate_contact(&contact)?;
-        let encrypted = Zeroizing::new(session.pickle().encrypt(&self.pickle_key.0));
-        if encrypted.is_empty() || encrypted.len() > MAX_PICKLE_BYTES {
+        let encrypted_session = Zeroizing::new(session.pickle().encrypt(&self.pickle_key.0));
+        if encrypted_session.is_empty() || encrypted_session.len() > MAX_PICKLE_BYTES {
+            return Err(SecretStorageError::QuotaExceeded);
+        }
+        let encrypted_account =
+            account.map(|account| Zeroizing::new(account.pickle().encrypt(&self.pickle_key.0)));
+        if encrypted_account
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_PICKLE_BYTES)
+        {
             return Err(SecretStorageError::QuotaExceeded);
         }
         let transaction = self
@@ -188,6 +308,17 @@ impl SecretStore {
             .map_err(database_error)?;
         if count(&transaction, "contacts")? >= MAX_CONTACTS {
             return Err(SecretStorageError::QuotaExceeded);
+        }
+        if let Some(encrypted_account) = encrypted_account.as_ref() {
+            let changed = transaction
+                .execute(
+                    "UPDATE account_state SET encrypted_pickle = ?1 WHERE singleton = 1",
+                    params![encrypted_account.as_str()],
+                )
+                .map_err(database_error)?;
+            if changed != 1 {
+                return Err(SecretStorageError::CorruptStorage);
+            }
         }
         transaction
             .execute(
@@ -209,7 +340,7 @@ impl SecretStore {
         transaction
             .execute(
                 "INSERT INTO session_state(contact_id, encrypted_pickle) VALUES (?1, ?2)",
-                params![contact.contact_id.0.as_slice(), encrypted.as_str()],
+                params![contact.contact_id.0.as_slice(), encrypted_session.as_str()],
             )
             .map_err(database_error)?;
         transaction.commit().map_err(database_error)?;
@@ -554,14 +685,22 @@ impl SecretStore {
 }
 
 fn validate_contact(contact: &NewContact) -> Result<(), SecretStorageError> {
-    if contact.display_name.is_empty()
-        || contact.display_name.len() > 128
-        || contact.display_name.chars().any(char::is_control)
-        || contact.inbound_recipient_hint == contact.outbound_recipient_hint
-    {
+    validate_display_name(&contact.display_name)?;
+    if contact.inbound_recipient_hint == contact.outbound_recipient_hint {
         return Err(SecretStorageError::CorruptStorage);
     }
     Ok(())
+}
+
+fn validate_display_name(display_name: &str) -> Result<(), SecretStorageError> {
+    if display_name.is_empty()
+        || display_name.len() > 128
+        || display_name.chars().any(char::is_control)
+    {
+        Err(SecretStorageError::CorruptStorage)
+    } else {
+        Ok(())
+    }
 }
 
 fn refill(
@@ -995,6 +1134,47 @@ mod tests {
                 .pending_outbox()
                 .is_ok_and(|value| value.is_empty())
         );
+    }
+
+    #[test]
+    fn active_contact_and_account_commit_together() {
+        let temporary = TemporaryPath::new("active-contact-account");
+        let (mut store, contact_id, session) = store_with_contact(temporary.path());
+        let original_keys = store.load_account().map(|account| account.one_time_keys());
+        let Ok(original_keys) = original_keys else {
+            panic!("test account should be loaded before the rejected commit");
+        };
+        let candidate = store.load_account();
+        let Ok(mut candidate) = candidate else {
+            panic!("test account candidate should be loaded");
+        };
+        candidate.generate_one_time_keys(1);
+        assert_ne!(candidate.one_time_keys(), original_keys);
+
+        assert!(
+            store
+                .add_active_contact_with_account(contact(contact_id), &session, &candidate)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_account().map(|account| account.one_time_keys()),
+            Ok(original_keys)
+        );
+
+        let active = store.active_contact(contact_id);
+        let Ok(Some(active)) = active else {
+            panic!("previous active contact should remain readable");
+        };
+        assert_eq!(active.contact_id(), contact_id);
+        assert_eq!(active.display_name(), "Alice");
+        assert_eq!(active.signing_identity_key(), &[0x11; 32]);
+        assert_eq!(active.curve_identity_key(), &[0x22; 32]);
+        assert_eq!(active.inbound_recipient_hint(), &[0x33; 16]);
+        assert_eq!(active.outbound_recipient_hint(), &[0x44; 16]);
+        let debug = format!("{active:?}");
+        assert!(!debug.contains("Alice"));
+        assert!(!debug.contains(&format!("{:?}", [0x11; 32])));
+        assert!(!debug.contains(&format!("{:?}", [0x33; 16])));
     }
 
     #[test]

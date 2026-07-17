@@ -17,4 +17,4 @@ pub use header::{
     KDF_HEADER_MAX_BYTES, KDF_SALT_LENGTH, KdfHeader, Passphrase,
 };
 pub use profile::SecretProfile;
-pub use state::{ContactId, NewContact, PendingEnvelope};
+pub use state::{ActiveContact, ContactId, NewContact, PendingEnvelope};

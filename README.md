@@ -43,8 +43,9 @@ SQLCipher-хранилище. Текущую версию всё равно мо
 `experimental preview`.
 
 На Этапе 4 уже проверены постоянный маршрут Alice -> Relay -> Bob с
-синтетическим payload и отдельный транзакционный мост crypto с очередью. Полный
-зашифрованный трёхузловой запуск пока не собран.
+синтетическим payload, отдельный транзакционный мост crypto с очередью и
+повторное открытие двух профилей с проверенным контактом. Полный зашифрованный
+трёхузловой запуск пока не собран.
 
 Для личных сообщений `Lantern v0.1 experimental preview` условно выбран
 `vodozemac 0.10.0` со стабильным Olm v1. Выбор не распространяется на beta или
@@ -91,6 +92,9 @@ Length-prefixed framing и общий deadline кадра записаны в
 восстановление входящего пути после сбоя описаны в
 [ADR 0026](docs/adr/0026-transactional-crypto-queue-bridge.md) и
 [crates/lantern-bridge/README.md](crates/lantern-bridge/README.md).
+Постоянные профили Alice и Bob после двух QR, SAS и двух зашифрованных
+подтверждений проверены в
+[ADR 0027](docs/adr/0027-persistent-verified-endpoint-contacts.md).
 Исходные данные находятся в
 [обзоре криптографии](docs/research/CRYPTOGRAPHY_REVIEW.md) и
 [результатах эксперимента](experiments/vodozemac-compat/RESULTS.md).
