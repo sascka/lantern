@@ -13,6 +13,7 @@ use crate::{
     BindAddress, LAN_PROTOCOL_VERSION, LanError, PeerAddress,
     framing::{receive_wire_frame, send_wire_frame},
     hello::{HELLO_BYTES, decode_hello, encode_hello},
+    peer_limit::{PeerLease, PeerLimiter},
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -23,6 +24,7 @@ const FRAME_IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct LanConnection {
     stream: TcpStream,
     terminated: bool,
+    _peer_lease: Option<PeerLease>,
 }
 
 impl LanConnection {
@@ -89,13 +91,17 @@ impl FrameTransport for LanConnection {
 /// One blocking listener for a manually selected private or loopback address.
 pub struct LanListener {
     listener: TcpListener,
+    peer_limiter: PeerLimiter,
 }
 
 impl LanListener {
     pub fn bind(address: BindAddress) -> Result<Self, LanError> {
         let listener =
             TcpListener::bind(address.socket_addr()).map_err(|_| LanError::BindFailed)?;
-        Ok(Self { listener })
+        Ok(Self {
+            listener,
+            peer_limiter: PeerLimiter::default(),
+        })
     }
 
     pub fn local_address(&self) -> Result<BindAddress, LanError> {
@@ -111,8 +117,9 @@ impl LanListener {
     }
 
     fn accept_with_timeout(&self, timeout: Duration) -> Result<LanConnection, LanError> {
-        let (stream, _) = self.listener.accept().map_err(|_| LanError::AcceptFailed)?;
-        finish_connection(stream, timeout)
+        let (stream, peer) = self.listener.accept().map_err(|_| LanError::AcceptFailed)?;
+        let peer_lease = self.peer_limiter.reserve(peer.ip())?;
+        finish_connection(stream, timeout, Some(peer_lease))
     }
 }
 
@@ -127,15 +134,20 @@ impl fmt::Debug for LanListener {
 pub fn connect(address: PeerAddress) -> Result<LanConnection, LanError> {
     let stream = TcpStream::connect_timeout(&address.socket_addr(), CONNECT_TIMEOUT)
         .map_err(|_| LanError::ConnectFailed)?;
-    finish_connection(stream, HANDSHAKE_TIMEOUT)
+    finish_connection(stream, HANDSHAKE_TIMEOUT, None)
 }
 
-fn finish_connection(stream: TcpStream, timeout: Duration) -> Result<LanConnection, LanError> {
+fn finish_connection(
+    stream: TcpStream,
+    timeout: Duration,
+    peer_lease: Option<PeerLease>,
+) -> Result<LanConnection, LanError> {
     configure_stream(&stream, timeout)?;
     exchange_hello(&stream, timeout)?;
     Ok(LanConnection {
         stream,
         terminated: false,
+        _peer_lease: peer_lease,
     })
 }
 

@@ -14,6 +14,8 @@ pub enum LanError {
     InvalidHello,
     UnsupportedVersion,
     HandshakeIoFailed,
+    PeerLimitReached,
+    PeerLimitUnavailable,
     ShutdownFailed,
 }
 
@@ -33,6 +35,10 @@ impl fmt::Display for LanError {
                 formatter.write_str("LAN peer uses an unsupported protocol version")
             }
             Self::HandshakeIoFailed => formatter.write_str("LAN version handshake failed"),
+            Self::PeerLimitReached => formatter.write_str("LAN peer connection limit reached"),
+            Self::PeerLimitUnavailable => {
+                formatter.write_str("LAN peer connection limiter is unavailable")
+            }
             Self::ShutdownFailed => formatter.write_str("LAN connection could not close cleanly"),
         }
     }
