@@ -5,6 +5,9 @@ use lantern_diagnostics::{
     JournalLimits, SizeBucket,
 };
 
+#[cfg(feature = "persistence")]
+use lantern_diagnostics::PersistentDiagnosticJournal;
+
 fn limits() -> JournalLimits {
     let result = JournalLimits::try_new(2, 2 * DIAGNOSTIC_RECORD_LOGICAL_BYTES, 60);
     let Ok(limits) = result else {
@@ -66,4 +69,52 @@ fn public_api_bounds_capacity_and_clears_on_clock_rollback() {
     };
     assert_eq!(rollback.maintenance().rollback_cleared_records(), 2);
     assert_eq!(journal.len(), 1);
+}
+
+#[cfg(feature = "persistence")]
+#[test]
+fn public_persistent_api_recovers_only_typed_records() {
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "lantern-diagnostic-public-{}-{sequence}.sqlite3",
+        std::process::id()
+    ));
+    let opened = PersistentDiagnosticJournal::open(&path, limits(), 100);
+    let Ok((mut journal, _)) = opened else {
+        panic!("public persistent diagnostics API could not open");
+    };
+    assert!(
+        journal
+            .record(event(EventCode::QueueSaved, Some(12_345)), 100)
+            .is_ok()
+    );
+    drop(journal);
+
+    let reopened = PersistentDiagnosticJournal::open(&path, limits(), 101);
+    let Ok((mut reopened, _)) = reopened else {
+        panic!("public persistent diagnostics API could not recover");
+    };
+    {
+        let view = reopened.view(101);
+        let Ok(view) = view else {
+            panic!("public persistent diagnostics API could not produce a view");
+        };
+        let Some(record) = view.records().next() else {
+            panic!("public persistent diagnostics API lost its record");
+        };
+        assert_eq!(record.code(), EventCode::QueueSaved);
+        assert_eq!(record.size_bucket(), SizeBucket::UpTo16KiB);
+    }
+    drop(reopened);
+    let _ = fs::remove_file(&path);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }

@@ -795,3 +795,327 @@ fn database_error(_error: rusqlite::Error) -> PersistentDiagnosticError {
     PersistentDiagnosticError::Database
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::{DIAGNOSTIC_RECORD_LOGICAL_BYTES, DiagnosticEvent};
+
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDatabase(PathBuf);
+
+    impl TestDatabase {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "lantern-diagnostics-{label}-{}-{sequence}.sqlite3",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let _ = fs::remove_file(path_with_suffix(&self.0, suffix));
+            }
+        }
+    }
+
+    fn limits(max_records: usize, retention: u64) -> JournalLimits {
+        let result = JournalLimits::try_new(
+            max_records,
+            max_records * DIAGNOSTIC_RECORD_LOGICAL_BYTES,
+            retention,
+        );
+        let Ok(limits) = result else {
+            panic!("valid persistent diagnostic limits were rejected");
+        };
+        limits
+    }
+
+    fn event(code: EventCode) -> DiagnosticEvent {
+        let result = DiagnosticEvent::try_new(code, EventOutcome::Success, 1, None, None);
+        let Ok(event) = result else {
+            panic!("valid persistent diagnostic event was rejected");
+        };
+        event
+    }
+
+    #[test]
+    fn records_survive_restart_and_expire_at_the_boundary() {
+        let database = TestDatabase::new("restart");
+        let opened = PersistentDiagnosticJournal::open(database.path(), limits(4, 60), 100);
+        let Ok((mut journal, recovery)) = opened else {
+            panic!("persistent diagnostics could not open");
+        };
+        assert_eq!(recovery, PersistentDiagnosticRecovery::default());
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        assert!(journal.record(event(EventCode::StorageOpened), 101).is_ok());
+        drop(journal);
+
+        let reopened = PersistentDiagnosticJournal::open(database.path(), limits(4, 60), 159);
+        let Ok((mut reopened, recovery)) = reopened else {
+            panic!("persistent diagnostics did not reopen");
+        };
+        assert_eq!(recovery.expired_records(), 0);
+        let view = reopened.view(159);
+        let Ok(view) = view else {
+            panic!("reopened diagnostics could not be viewed");
+        };
+        assert_eq!(
+            view.records()
+                .map(|record| record.code())
+                .collect::<Vec<_>>(),
+            [EventCode::NodeStarted, EventCode::StorageOpened]
+        );
+        drop(reopened);
+
+        let expired = PersistentDiagnosticJournal::open(database.path(), limits(4, 60), 160);
+        let Ok((expired, recovery)) = expired else {
+            panic!("persistent diagnostics could not expire old records");
+        };
+        assert_eq!(recovery.expired_records(), 1);
+        assert_eq!(expired.len(), 1);
+    }
+
+    #[test]
+    fn restart_clock_rollback_clears_all_records() {
+        let database = TestDatabase::new("rollback");
+        let opened = PersistentDiagnosticJournal::open(database.path(), limits(4, 60), 1_000);
+        let Ok((mut journal, _)) = opened else {
+            panic!("persistent diagnostics could not open before rollback");
+        };
+        assert!(journal.record(event(EventCode::NodeStarted), 1_010).is_ok());
+        assert!(journal.record(event(EventCode::QueueSaved), 1_020).is_ok());
+        drop(journal);
+
+        let reopened = PersistentDiagnosticJournal::open(database.path(), limits(4, 60), 900);
+        let Ok((reopened, recovery)) = reopened else {
+            panic!("persistent diagnostics did not handle clock rollback");
+        };
+        assert!(recovery.clock_rollback_detected());
+        assert_eq!(recovery.cleared_records(), 2);
+        assert!(reopened.is_empty());
+    }
+
+    #[test]
+    fn quota_eviction_is_saved_across_restart() {
+        let database = TestDatabase::new("quota");
+        let opened = PersistentDiagnosticJournal::open(database.path(), limits(2, 60), 100);
+        let Ok((mut journal, _)) = opened else {
+            panic!("persistent diagnostics could not open for quota test");
+        };
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        assert!(journal.record(event(EventCode::StorageOpened), 101).is_ok());
+        let third = journal.record(event(EventCode::QueueRecovered), 102);
+        let Ok(third) = third else {
+            panic!("persistent diagnostics could not apply quota");
+        };
+        assert_eq!(third.maintenance().evicted_records(), 1);
+        drop(journal);
+
+        let reopened = PersistentDiagnosticJournal::open(database.path(), limits(2, 60), 102);
+        let Ok((mut reopened, _)) = reopened else {
+            panic!("quota result did not survive restart");
+        };
+        let view = reopened.view(102);
+        let Ok(view) = view else {
+            panic!("quota result could not be viewed");
+        };
+        assert_eq!(
+            view.records()
+                .map(|record| record.code())
+                .collect::<Vec<_>>(),
+            [EventCode::StorageOpened, EventCode::QueueRecovered]
+        );
+    }
+
+    #[test]
+    fn failed_transaction_does_not_change_memory_or_disk() {
+        let database = TestDatabase::new("transaction");
+        let opened = PersistentDiagnosticJournal::open(database.path(), limits(3, 60), 100);
+        let Ok((mut journal, _)) = opened else {
+            panic!("persistent diagnostics could not open for transaction test");
+        };
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        assert!(
+            journal
+                .connection
+                .pragma_update(None, "query_only", true)
+                .is_ok()
+        );
+        assert_eq!(
+            journal.record(event(EventCode::StorageOpened), 101),
+            Err(PersistentDiagnosticError::Database)
+        );
+        assert_eq!(journal.len(), 1);
+        assert!(
+            journal
+                .connection
+                .pragma_update(None, "query_only", false)
+                .is_ok()
+        );
+        drop(journal);
+
+        let reopened = PersistentDiagnosticJournal::open(database.path(), limits(3, 60), 101);
+        let Ok((reopened, _)) = reopened else {
+            panic!("persistent diagnostics did not recover previous transaction");
+        };
+        assert_eq!(reopened.len(), 1);
+    }
+
+    #[test]
+    fn wrong_limits_and_corrupt_codes_are_rejected() {
+        let database = TestDatabase::new("corrupt");
+        let opened = PersistentDiagnosticJournal::open(database.path(), limits(3, 60), 100);
+        let Ok((mut journal, _)) = opened else {
+            panic!("persistent diagnostics could not open before corruption");
+        };
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        drop(journal);
+        assert!(matches!(
+            PersistentDiagnosticJournal::open(database.path(), limits(2, 60), 100),
+            Err(PersistentDiagnosticError::LimitMismatch)
+        ));
+
+        let connection = Connection::open(database.path());
+        let Ok(connection) = connection else {
+            panic!("test could not open diagnostics database for corruption");
+        };
+        assert!(
+            connection
+                .execute("PRAGMA ignore_check_constraints = ON", [])
+                .is_ok()
+        );
+        assert!(
+            connection
+                .execute("UPDATE diagnostic_records SET code = 99", [])
+                .is_ok()
+        );
+        drop(connection);
+        assert!(matches!(
+            PersistentDiagnosticJournal::open(database.path(), limits(3, 60), 100),
+            Err(PersistentDiagnosticError::CorruptData)
+        ));
+    }
+
+    #[test]
+    fn wrong_application_schema_and_extended_retention_are_rejected() {
+        let wrong_application = TestDatabase::new("wrong-application");
+        let connection = Connection::open(wrong_application.path());
+        let Ok(connection) = connection else {
+            panic!("test could not create a foreign database");
+        };
+        assert!(
+            connection
+                .pragma_update(None, "application_id", 0x1234_i64)
+                .is_ok()
+        );
+        drop(connection);
+        assert!(matches!(
+            PersistentDiagnosticJournal::open(wrong_application.path(), limits(3, 60), 100),
+            Err(PersistentDiagnosticError::WrongApplication)
+        ));
+
+        let wrong_schema = TestDatabase::new("wrong-schema");
+        let opened = PersistentDiagnosticJournal::open(wrong_schema.path(), limits(3, 60), 100);
+        let Ok((journal, _)) = opened else {
+            panic!("persistent diagnostics could not open before schema change");
+        };
+        drop(journal);
+        let connection = Connection::open(wrong_schema.path());
+        let Ok(connection) = connection else {
+            panic!("test could not open diagnostics database for schema change");
+        };
+        assert!(
+            connection
+                .pragma_update(None, "user_version", 2_i64)
+                .is_ok()
+        );
+        drop(connection);
+        assert!(matches!(
+            PersistentDiagnosticJournal::open(wrong_schema.path(), limits(3, 60), 100),
+            Err(PersistentDiagnosticError::UnsupportedSchema)
+        ));
+
+        let extended = TestDatabase::new("extended-retention");
+        let opened = PersistentDiagnosticJournal::open(extended.path(), limits(3, 60), 100);
+        let Ok((mut journal, _)) = opened else {
+            panic!("persistent diagnostics could not open before retention change");
+        };
+        assert!(journal.record(event(EventCode::NodeStarted), 100).is_ok());
+        drop(journal);
+        let connection = Connection::open(extended.path());
+        let Ok(connection) = connection else {
+            panic!("test could not open diagnostics database for retention change");
+        };
+        assert!(
+            connection
+                .execute(
+                    "UPDATE diagnostic_records SET expires_at_wall_seconds = 1000",
+                    [],
+                )
+                .is_ok()
+        );
+        drop(connection);
+        assert!(matches!(
+            PersistentDiagnosticJournal::open(extended.path(), limits(3, 60), 100),
+            Err(PersistentDiagnosticError::CorruptData)
+        ));
+    }
+
+    #[test]
+    fn file_limit_permissions_symlinks_and_debug_are_safe() {
+        let oversized = TestDatabase::new("oversized");
+        let file = fs::File::create(oversized.path());
+        let Ok(file) = file else {
+            panic!("could not create oversized diagnostics test file");
+        };
+        assert!(file.set_len(MAX_DIAGNOSTIC_FILE_BYTES + 1).is_ok());
+        assert!(matches!(
+            PersistentDiagnosticJournal::open(oversized.path(), limits(2, 60), 123_456_789),
+            Err(PersistentDiagnosticError::FileTooLarge)
+        ));
+
+        let database = TestDatabase::new("permissions-private-marker");
+        let opened = PersistentDiagnosticJournal::open(database.path(), limits(2, 60), 123_456_789);
+        let Ok((journal, _)) = opened else {
+            panic!("persistent diagnostics could not open for redaction test");
+        };
+        let output = format!("{journal:?} {}", PersistentDiagnosticError::Database);
+        assert!(!output.contains("permissions-private-marker"));
+        assert!(!output.contains("123456789"));
+        drop(journal);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+
+            let metadata = fs::metadata(database.path());
+            let Ok(metadata) = metadata else {
+                panic!("diagnostics database metadata could not be read");
+            };
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            let link = TestDatabase::new("symlink");
+            assert!(symlink(database.path(), link.path()).is_ok());
+            assert!(matches!(
+                PersistentDiagnosticJournal::open(link.path(), limits(2, 60), 123_456_789),
+                Err(PersistentDiagnosticError::Io)
+            ));
+        }
+    }
+}
