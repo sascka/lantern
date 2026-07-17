@@ -252,3 +252,192 @@ fn decode_u32_field(
         .map_err(|_| SecretStorageError::MalformedHeader)
 }
 
+#[cfg(test)]
+mod tests {
+    use argon2::{Algorithm, Argon2, AssociatedData, Block, ParamsBuilder, Version};
+    use zeroize::Zeroize;
+
+    use super::{
+        ARGON2_MEMORY_KIB, ARGON2_PARALLELISM, ARGON2_PASSES, DATABASE_KEY_LENGTH, KdfHeader,
+        Passphrase,
+    };
+    use crate::SecretStorageError;
+
+    const SALT: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
+
+    fn header() -> KdfHeader {
+        KdfHeader { salt: SALT }
+    }
+
+    #[test]
+    fn header_has_one_canonical_encoding() {
+        let encoded = header().encode();
+        let Ok(encoded) = encoded else {
+            panic!("test header could not be encoded");
+        };
+        let expected = [
+            0xa7, 0x00, 0x01, 0x01, 0x01, 0x02, 0x50, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x03, 0x1a, 0x00, 0x01, 0x00,
+            0x00, 0x04, 0x03, 0x05, 0x04, 0x06, 0x18, 0x20,
+        ];
+        assert_eq!(encoded, expected);
+        assert_eq!(KdfHeader::decode(&encoded), Ok(header()));
+    }
+
+    #[test]
+    fn malformed_and_noncanonical_headers_are_rejected() {
+        let encoded = header().encode();
+        let Ok(encoded) = encoded else {
+            panic!("test header could not be encoded");
+        };
+
+        for prefix_length in 0..encoded.len() {
+            assert!(KdfHeader::decode(&encoded[..prefix_length]).is_err());
+        }
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            KdfHeader::decode(&trailing),
+            Err(SecretStorageError::MalformedHeader)
+        );
+
+        let mut noncanonical_map = encoded.clone();
+        noncanonical_map.splice(0..1, [0xb8, 0x07]);
+        assert_eq!(
+            KdfHeader::decode(&noncanonical_map),
+            Err(SecretStorageError::MalformedHeader)
+        );
+    }
+
+    #[test]
+    fn changed_parameters_are_not_accepted() {
+        let encoded = header().encode();
+        let Ok(encoded) = encoded else {
+            panic!("test header could not be encoded");
+        };
+
+        for (index, replacement) in [(2, 2), (4, 2), (28, 1), (30, 2), (32, 3), (35, 31)] {
+            let mut changed = encoded.clone();
+            changed[index] = replacement;
+            assert_eq!(
+                KdfHeader::decode(&changed),
+                Err(SecretStorageError::UnsupportedHeader)
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_keys_and_indefinite_values_are_rejected() {
+        let encoded = header().encode();
+        let Ok(encoded) = encoded else {
+            panic!("test header could not be encoded");
+        };
+
+        for (index, replacement) in [(0, 0xbf), (3, 0), (3, 7), (6, 0x5f), (6, 0x4f)] {
+            let mut changed = encoded.clone();
+            changed[index] = replacement;
+            assert_eq!(
+                KdfHeader::decode(&changed),
+                Err(SecretStorageError::MalformedHeader)
+            );
+        }
+
+        for byte in 0_u8..=u8::MAX {
+            assert!(KdfHeader::decode(&[byte]).is_err());
+        }
+    }
+
+    #[test]
+    fn passphrase_boundaries_count_unicode_scalars() {
+        assert!(Passphrase::new("a".repeat(15)).is_err());
+        assert!(Passphrase::new("a".repeat(16)).is_ok());
+        assert!(Passphrase::new("я".repeat(128)).is_ok());
+        assert!(Passphrase::new("я".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn production_parameters_derive_a_stable_nonzero_key() {
+        assert_eq!(ARGON2_MEMORY_KIB, 65_536);
+        assert_eq!(ARGON2_PASSES, 3);
+        assert_eq!(ARGON2_PARALLELISM, 4);
+        assert_eq!(DATABASE_KEY_LENGTH, 32);
+
+        let passphrase = Passphrase::new("correct horse battery staple".to_owned());
+        let Ok(passphrase) = passphrase else {
+            panic!("test passphrase was rejected");
+        };
+        let first = header().derive_database_key(&passphrase);
+        let second = header().derive_database_key(&passphrase);
+        let (Ok(first), Ok(second)) = (first, second) else {
+            panic!("test key could not be derived");
+        };
+        assert_eq!(first.bytes, second.bytes);
+        assert_ne!(first.bytes, [0_u8; DATABASE_KEY_LENGTH]);
+    }
+
+    #[test]
+    fn rfc_9106_argon2id_vector_matches() {
+        let data = AssociatedData::new(&[0x04; 12]);
+        let Ok(data) = data else {
+            panic!("RFC associated data was rejected");
+        };
+        let mut builder = ParamsBuilder::new();
+        builder
+            .m_cost(32)
+            .t_cost(3)
+            .p_cost(4)
+            .output_len(32)
+            .data(data);
+        let params = builder.build();
+        let Ok(params) = params else {
+            panic!("RFC parameters were rejected");
+        };
+        let argon2 =
+            Argon2::new_with_secret(&[0x03; 8], Algorithm::Argon2id, Version::V0x13, params);
+        let Ok(argon2) = argon2 else {
+            panic!("RFC secret was rejected");
+        };
+        let mut output = [0_u8; 32];
+        let mut memory = vec![Block::default(); 32];
+        assert!(
+            argon2
+                .hash_password_into_with_memory(&[0x01; 32], &[0x02; 16], &mut output, &mut memory,)
+                .is_ok()
+        );
+        for block in &mut memory {
+            block.zeroize();
+        }
+        assert_eq!(
+            output,
+            [
+                0x0d, 0x64, 0x0d, 0xf5, 0x8d, 0x78, 0x76, 0x6c, 0x08, 0xc0, 0x37, 0xa3, 0x4a, 0x8b,
+                0x53, 0xc9, 0xd0, 0x1e, 0xf0, 0x45, 0x2d, 0x75, 0xb6, 0x5e, 0xb5, 0x25, 0x20, 0xe9,
+                0x6b, 0x01, 0xe6, 0x59,
+            ]
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_all_secret_values() {
+        let secret = "passphrase-marker-1234";
+        let passphrase = Passphrase::new(secret.to_owned());
+        let Ok(passphrase) = passphrase else {
+            panic!("test passphrase was rejected");
+        };
+        let key = header().derive_database_key(&passphrase);
+        let Ok(key) = key else {
+            panic!("test key could not be derived");
+        };
+        let header_debug = format!("{:?}", header());
+        let passphrase_debug = format!("{passphrase:?}");
+        let key_debug = format!("{key:?}");
+
+        assert!(!header_debug.contains("00010203"));
+        assert!(!passphrase_debug.contains(secret));
+        assert!(!key_debug.contains("bytes"));
+    }
+}

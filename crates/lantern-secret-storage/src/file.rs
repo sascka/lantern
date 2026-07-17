@@ -102,3 +102,157 @@ fn validate_open_file(_file: &File) -> Result<(), SecretStorageError> {
     Err(SecretStorageError::UnsupportedPlatform)
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    use super::{create_kdf_header_file, read_kdf_header_file};
+    use crate::{KDF_HEADER_MAX_BYTES, SecretStorageError};
+
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    struct TemporaryPath {
+        path: PathBuf,
+    }
+
+    impl TemporaryPath {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+            let filename = format!(
+                "lantern-secret-storage-{}-{sequence}-{label}",
+                std::process::id()
+            );
+            let path = std::env::temp_dir().join(filename);
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir_all(&path);
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TemporaryPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn created_header_is_restricted_and_round_trips() {
+        let temporary = TemporaryPath::new("round-trip");
+        let created = create_kdf_header_file(temporary.path());
+        let Ok(created) = created else {
+            panic!("KDF header could not be created");
+        };
+        let reopened = read_kdf_header_file(temporary.path());
+        assert_eq!(reopened, Ok(created));
+
+        #[cfg(unix)]
+        {
+            let metadata = fs::metadata(temporary.path());
+            let Ok(metadata) = metadata else {
+                panic!("KDF header metadata could not be read");
+            };
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
+        }
+    }
+
+    #[test]
+    fn existing_file_is_never_replaced() {
+        let temporary = TemporaryPath::new("existing");
+        assert!(fs::write(temporary.path(), b"owner data").is_ok());
+        assert_eq!(
+            create_kdf_header_file(temporary.path()),
+            Err(SecretStorageError::AlreadyExists)
+        );
+        let contents = fs::read(temporary.path());
+        let Ok(contents) = contents else {
+            panic!("existing test file could not be read");
+        };
+        assert_eq!(contents, b"owner data");
+    }
+
+    #[test]
+    fn empty_and_oversized_files_are_rejected() {
+        let empty = TemporaryPath::new("empty");
+        assert!(fs::write(empty.path(), []).is_ok());
+        assert_eq!(
+            read_kdf_header_file(empty.path()),
+            Err(SecretStorageError::UnsafeFile)
+        );
+
+        let oversized = TemporaryPath::new("oversized");
+        assert!(fs::write(oversized.path(), vec![0_u8; KDF_HEADER_MAX_BYTES + 1]).is_ok());
+        assert_eq!(
+            read_kdf_header_file(oversized.path()),
+            Err(SecretStorageError::UnsafeFile)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_hardlink_and_open_permissions_are_rejected() {
+        let original = TemporaryPath::new("original");
+        let link = TemporaryPath::new("symlink");
+        let hardlink = TemporaryPath::new("hardlink");
+        let created = create_kdf_header_file(original.path());
+        assert!(created.is_ok());
+
+        assert!(symlink(original.path(), link.path()).is_ok());
+        assert_eq!(
+            read_kdf_header_file(link.path()),
+            Err(SecretStorageError::UnsafeFile)
+        );
+
+        assert!(fs::hard_link(original.path(), hardlink.path()).is_ok());
+        assert_eq!(
+            read_kdf_header_file(original.path()),
+            Err(SecretStorageError::UnsafeFile)
+        );
+        assert_eq!(
+            read_kdf_header_file(hardlink.path()),
+            Err(SecretStorageError::UnsafeFile)
+        );
+
+        assert!(fs::remove_file(hardlink.path()).is_ok());
+        let permissions = fs::Permissions::from_mode(0o644);
+        assert!(fs::set_permissions(original.path(), permissions).is_ok());
+        assert_eq!(
+            read_kdf_header_file(original.path()),
+            Err(SecretStorageError::UnsafeFile)
+        );
+    }
+
+    #[test]
+    fn directory_is_rejected_without_reading_it() {
+        let temporary = TemporaryPath::new("directory");
+        assert!(fs::create_dir(temporary.path()).is_ok());
+        assert_eq!(
+            read_kdf_header_file(temporary.path()),
+            Err(SecretStorageError::UnsafeFile)
+        );
+    }
+
+    #[test]
+    fn file_errors_never_include_the_path() {
+        let marker = "private-path-marker";
+        let temporary = TemporaryPath::new(marker);
+        let error = read_kdf_header_file(temporary.path());
+        let Err(error) = error else {
+            panic!("missing file was unexpectedly accepted");
+        };
+        assert!(!format!("{error}").contains(marker));
+        assert!(!format!("{error:?}").contains(marker));
+    }
+}
