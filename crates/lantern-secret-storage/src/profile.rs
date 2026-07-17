@@ -132,3 +132,127 @@ fn sync_directory(directory: &Path) -> Result<(), SecretStorageError> {
     handle.sync_all().map_err(|_| SecretStorageError::Io)
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+
+    use super::SecretProfile;
+    use crate::{Passphrase, SecretStorageError};
+
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "lantern-secret-profile-{}-{sequence}-{label}",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn passphrase() -> Passphrase {
+        let value = Passphrase::new("correct horse battery staple".to_owned());
+        let Ok(value) = value else {
+            panic!("test passphrase was rejected");
+        };
+        value
+    }
+
+    #[test]
+    fn profile_round_trips_through_password_unlock() {
+        let temporary = TemporaryDirectory::new("round-trip");
+        let profile = SecretProfile::create(temporary.path(), &passphrase());
+        let Ok(profile) = profile else {
+            panic!("profile could not be created");
+        };
+        let id = profile.profile_id();
+        let keys = profile
+            .load_account()
+            .map(|account| account.identity_keys());
+        assert!(keys.is_ok());
+        drop(profile);
+
+        let reopened = SecretProfile::open(temporary.path(), &passphrase());
+        let Ok(reopened) = reopened else {
+            panic!("profile could not be reopened");
+        };
+        assert_eq!(reopened.profile_id(), id);
+        assert_eq!(
+            reopened
+                .load_account()
+                .map(|account| account.identity_keys()),
+            keys
+        );
+
+        #[cfg(unix)]
+        {
+            let metadata = fs::metadata(temporary.path());
+            let Ok(metadata) = metadata else {
+                panic!("profile directory metadata could not be read");
+            };
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_and_unsafe_profile_directories_are_rejected() {
+        let incomplete = TemporaryDirectory::new("incomplete");
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        assert!(builder.create(incomplete.path()).is_ok());
+        assert_eq!(
+            SecretProfile::open(incomplete.path(), &passphrase()).err(),
+            Some(SecretStorageError::IncompleteProfile)
+        );
+
+        let permissive = TemporaryDirectory::new("permissive");
+        assert!(fs::create_dir(permissive.path()).is_ok());
+        assert_eq!(
+            SecretProfile::open(permissive.path(), &passphrase()).err(),
+            Some(SecretStorageError::UnsafeFile)
+        );
+
+        let target = TemporaryDirectory::new("target");
+        let link = TemporaryDirectory::new("link");
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        assert!(builder.create(target.path()).is_ok());
+        assert!(symlink(target.path(), link.path()).is_ok());
+        assert_eq!(
+            SecretProfile::open(link.path(), &passphrase()).err(),
+            Some(SecretStorageError::UnsafeFile)
+        );
+    }
+
+    #[test]
+    fn existing_profile_directory_is_never_reused() {
+        let temporary = TemporaryDirectory::new("existing");
+        assert!(fs::create_dir(temporary.path()).is_ok());
+        assert_eq!(
+            SecretProfile::create(temporary.path(), &passphrase()).err(),
+            Some(SecretStorageError::AlreadyExists)
+        );
+    }
+}

@@ -649,3 +649,185 @@ pub(crate) fn database_error(_error: rusqlite::Error) -> SecretStorageError {
     SecretStorageError::Io
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use vodozemac::olm::Account;
+
+    use super::SecretStore;
+    use crate::{DatabaseKey, SecretStorageError};
+
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    fn key() -> DatabaseKey {
+        DatabaseKey::from_bytes([0x25; 32])
+    }
+
+    fn wrong_key() -> DatabaseKey {
+        DatabaseKey::from_bytes([0xa6; 32])
+    }
+
+    struct TemporaryPath(PathBuf);
+
+    impl TemporaryPath {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "lantern-secret-database-{}-{sequence}-{label}.sqlite3",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            let mut journal = self.0.as_os_str().to_os_string();
+            journal.push("-journal");
+            let _ = fs::remove_file(PathBuf::from(journal));
+        }
+    }
+
+    #[test]
+    fn encrypted_database_round_trips_account_without_plaintext_header() {
+        let temporary = TemporaryPath::new("round-trip");
+        let store = SecretStore::create(temporary.path(), &key());
+        let Ok(mut store) = store else {
+            panic!("encrypted database could not be created");
+        };
+        let first_profile = store.profile_id();
+        assert!(store.load_account().is_ok());
+
+        let replacement = Account::new();
+        let replacement_keys = replacement.identity_keys();
+        assert!(store.replace_account(&replacement).is_ok());
+        drop(store);
+
+        let reopened = SecretStore::open(temporary.path(), &key());
+        let Ok(reopened) = reopened else {
+            panic!("encrypted database could not be reopened");
+        };
+        assert_eq!(reopened.profile_id(), first_profile);
+        let account = reopened.load_account();
+        let Ok(account) = account else {
+            panic!("stored account could not be restored");
+        };
+        assert_eq!(account.identity_keys(), replacement_keys);
+
+        let bytes = fs::read(temporary.path());
+        let Ok(bytes) = bytes else {
+            panic!("encrypted database bytes could not be read");
+        };
+        assert_ne!(bytes.get(..16), Some(b"SQLite format 3\0".as_slice()));
+    }
+
+    #[test]
+    fn wrong_key_and_changed_first_page_fail_closed() {
+        let temporary = TemporaryPath::new("wrong-key");
+        let store = SecretStore::create(temporary.path(), &key());
+        assert!(store.is_ok());
+        drop(store);
+        assert!(matches!(
+            SecretStore::open(temporary.path(), &wrong_key()),
+            Err(SecretStorageError::UnlockFailed)
+        ));
+
+        let bytes = fs::read(temporary.path());
+        let Ok(mut bytes) = bytes else {
+            panic!("encrypted database could not be read for mutation");
+        };
+        if let Some(byte) = bytes.first_mut() {
+            *byte ^= 1;
+        } else {
+            panic!("encrypted database was empty");
+        }
+        assert!(fs::write(temporary.path(), bytes).is_ok());
+        assert!(matches!(
+            SecretStore::open(temporary.path(), &key()),
+            Err(SecretStorageError::UnlockFailed)
+        ));
+    }
+
+    #[test]
+    fn unknown_schema_and_existing_file_are_rejected() {
+        let temporary = TemporaryPath::new("schema");
+        let store = SecretStore::create(temporary.path(), &key());
+        let Ok(store) = store else {
+            panic!("encrypted database could not be created for schema test");
+        };
+        assert_eq!(
+            SecretStore::create(temporary.path(), &key()).err(),
+            Some(SecretStorageError::AlreadyExists)
+        );
+        assert!(store.connection.execute("DROP TABLE messages", []).is_ok());
+        drop(store);
+        assert!(matches!(
+            SecretStore::open(temporary.path(), &key()),
+            Err(SecretStorageError::CorruptStorage)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_paths_and_permissions_are_rejected() {
+        let original = TemporaryPath::new("original");
+        let link = TemporaryPath::new("link");
+        let hardlink = TemporaryPath::new("hardlink");
+        let store = SecretStore::create(original.path(), &key());
+        assert!(store.is_ok());
+        drop(store);
+
+        assert!(symlink(original.path(), link.path()).is_ok());
+        assert!(matches!(
+            SecretStore::open(link.path(), &key()),
+            Err(SecretStorageError::UnsafeFile)
+        ));
+
+        assert!(fs::hard_link(original.path(), hardlink.path()).is_ok());
+        assert!(matches!(
+            SecretStore::open(original.path(), &key()),
+            Err(SecretStorageError::UnsafeFile)
+        ));
+        assert!(fs::remove_file(hardlink.path()).is_ok());
+
+        assert!(fs::set_permissions(original.path(), fs::Permissions::from_mode(0o644)).is_ok());
+        assert!(matches!(
+            SecretStore::open(original.path(), &key()),
+            Err(SecretStorageError::UnsafeFile)
+        ));
+    }
+
+    #[test]
+    fn debug_and_errors_do_not_disclose_path_or_key() {
+        let marker = "secret-database-path-marker";
+        let temporary = TemporaryPath::new(marker);
+        let store = SecretStore::create(temporary.path(), &key());
+        let Ok(store) = store else {
+            panic!("encrypted database could not be created for debug test");
+        };
+        let debug = format!("{store:?}");
+        assert!(!debug.contains(marker));
+        assert!(!debug.contains("25252525"));
+        drop(store);
+
+        let error = SecretStore::open(temporary.path(), &wrong_key());
+        let Err(error) = error else {
+            panic!("wrong key unexpectedly opened the database");
+        };
+        let text = format!("{error:?} {error}");
+        assert!(!text.contains(marker));
+        assert!(!text.contains("a6a6a6a6"));
+    }
+}

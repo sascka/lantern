@@ -704,3 +704,271 @@ fn next_sequence(transaction: &Transaction<'_>, table: &str) -> Result<i64, Secr
         .ok_or(SecretStorageError::QuotaExceeded)
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, Instant},
+    };
+
+    use vodozemac::olm::{Account, OlmMessage, Session, SessionConfig};
+
+    use super::{ContactId, NewContact, refill};
+    use crate::{DatabaseKey, SecretStorageError, SecretStore};
+
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    struct TemporaryPath(PathBuf);
+
+    impl TemporaryPath {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "lantern-secret-state-{}-{sequence}-{label}.sqlite3",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            let mut journal = self.0.as_os_str().to_os_string();
+            journal.push("-journal");
+            let _ = fs::remove_file(PathBuf::from(journal));
+        }
+    }
+
+    fn key() -> DatabaseKey {
+        DatabaseKey::from_bytes([0x39; 32])
+    }
+
+    fn established_sessions() -> (Session, Session) {
+        let alice = Account::new();
+        let mut bob = Account::new();
+        bob.generate_one_time_keys(1);
+        let one_time_key = bob.one_time_keys().values().next().copied();
+        let Some(one_time_key) = one_time_key else {
+            panic!("test one-time key was not generated");
+        };
+        let session = alice.create_outbound_session(
+            SessionConfig::version_1(),
+            bob.curve25519_key(),
+            one_time_key,
+        );
+        let Ok(mut alice_session) = session else {
+            panic!("test outbound session could not be created");
+        };
+        let first = alice_session.encrypt(b"first");
+        let Ok(OlmMessage::PreKey(first)) = first else {
+            panic!("test first message was not pre-key");
+        };
+        let inbound =
+            bob.create_inbound_session(SessionConfig::version_1(), alice.curve25519_key(), &first);
+        let Ok(inbound) = inbound else {
+            panic!("test inbound session could not be created");
+        };
+        (alice_session, inbound.session)
+    }
+
+    fn contact(id: ContactId) -> NewContact {
+        NewContact {
+            contact_id: id,
+            display_name: "Alice".to_owned(),
+            signing_identity_key: [0x11; 32],
+            curve_identity_key: [0x22; 32],
+            inbound_recipient_hint: [0x33; 16],
+            outbound_recipient_hint: [0x44; 16],
+        }
+    }
+
+    fn store_with_contact(path: &Path) -> (SecretStore, ContactId, Session) {
+        let store = SecretStore::create(path, &key());
+        let Ok(mut store) = store else {
+            panic!("test secret store could not be created");
+        };
+        let id = ContactId::from_bytes([0x51; 16]);
+        let (alice, bob) = established_sessions();
+        assert!(store.add_active_contact(contact(id), &alice).is_ok());
+        (store, id, bob)
+    }
+
+    #[test]
+    fn contact_and_pending_bursts_stop_before_extra_decrypt() {
+        let temporary = TemporaryPath::new("bursts");
+        let (mut store, contact_id, _) = store_with_contact(temporary.path());
+        for value in 0..8_u8 {
+            assert!(
+                store
+                    .reserve_contact_attempt([value; 16], contact_id)
+                    .is_ok()
+            );
+        }
+        assert_eq!(
+            store.reserve_contact_attempt([0x80; 16], contact_id),
+            Err(SecretStorageError::RateLimited)
+        );
+        drop(store);
+
+        let reopened = SecretStore::open(temporary.path(), &key());
+        let Ok(mut reopened) = reopened else {
+            panic!("test secret store could not be reopened");
+        };
+        assert_eq!(
+            reopened.reserve_contact_attempt([0x81; 16], contact_id),
+            Err(SecretStorageError::RateLimited)
+        );
+
+        for value in 0..4_u8 {
+            assert!(
+                reopened
+                    .reserve_pending_contact_attempt([0xa0 + value; 16])
+                    .is_ok()
+            );
+        }
+        assert_eq!(
+            reopened.reserve_pending_contact_attempt([0xaf; 16]),
+            Err(SecretStorageError::RateLimited)
+        );
+    }
+
+    #[test]
+    fn successful_commit_refunds_one_attempt_and_persists_candidate_ratchet() {
+        let temporary = TemporaryPath::new("commit");
+        let (mut store, contact_id, mut receiver) = store_with_contact(temporary.path());
+        let message_id = [0x61; 16];
+        assert!(
+            store
+                .reserve_contact_attempt(message_id, contact_id)
+                .is_ok()
+        );
+        let mut candidate = store.load_session(contact_id);
+        let Ok(ref mut candidate) = candidate else {
+            panic!("test session could not be loaded");
+        };
+        let encrypted = candidate.encrypt(b"committed ratchet");
+        let Ok(encrypted) = encrypted else {
+            panic!("test message could not be encrypted");
+        };
+        assert!(
+            store
+                .commit_contact_attempt(message_id, contact_id, candidate)
+                .is_ok()
+        );
+        assert_eq!(
+            store.reserve_contact_attempt(message_id, contact_id),
+            Err(SecretStorageError::AttemptAlreadyProcessed)
+        );
+        let decrypted = receiver.decrypt(&encrypted);
+        assert!(decrypted.is_ok_and(|value| value == b"committed ratchet"));
+        assert!(
+            store
+                .reserve_contact_attempt([0x62; 16], contact_id)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn outgoing_ratchet_and_pending_envelope_commit_together() {
+        let temporary = TemporaryPath::new("outbox");
+        let (mut store, contact_id, mut receiver) = store_with_contact(temporary.path());
+        let mut candidate = store.load_session(contact_id);
+        let Ok(ref mut candidate) = candidate else {
+            panic!("test session could not be loaded");
+        };
+        let encrypted = candidate.encrypt(b"outbox message");
+        let Ok(encrypted) = encrypted else {
+            panic!("test outbox message could not be encrypted");
+        };
+        let message_id = [0x71; 16];
+        let envelope = b"immutable envelope bytes";
+        assert!(
+            store
+                .commit_outgoing(contact_id, candidate, message_id, envelope)
+                .is_ok()
+        );
+        drop(store);
+
+        let reopened = SecretStore::open(temporary.path(), &key());
+        let Ok(mut reopened) = reopened else {
+            panic!("test secret store could not be reopened");
+        };
+        let pending = reopened.pending_outbox();
+        let Ok(pending) = pending else {
+            panic!("test pending outbox could not be loaded");
+        };
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message_id(), &message_id);
+        assert_eq!(pending[0].envelope_cbor(), envelope);
+        let decrypted = receiver.decrypt(&encrypted);
+        assert!(decrypted.is_ok_and(|value| value == b"outbox message"));
+        assert!(
+            reopened
+                .remove_pending_outbox(message_id)
+                .is_ok_and(|value| value)
+        );
+        assert!(
+            reopened
+                .pending_outbox()
+                .is_ok_and(|value| value.is_empty())
+        );
+    }
+
+    #[test]
+    fn discrete_refill_preserves_remainder_and_never_exceeds_capacity() {
+        let anchor = Instant::now();
+        let now = anchor + Duration::from_secs(125);
+        let (tokens, moved) = refill(2, 8, Duration::from_secs(60), anchor, now);
+        assert_eq!(tokens, 4);
+        assert_eq!(now.duration_since(moved), Duration::from_secs(5));
+
+        let later = now + Duration::from_secs(10_000);
+        let (tokens, moved) = refill(tokens, 8, Duration::from_secs(60), moved, later);
+        assert_eq!(tokens, 8);
+        assert!(moved <= later);
+        assert!(later.duration_since(moved) < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn encrypted_file_does_not_contain_contact_or_outbox_markers() {
+        let temporary = TemporaryPath::new("plaintext-search");
+        let store = SecretStore::create(temporary.path(), &key());
+        let Ok(mut store) = store else {
+            panic!("test secret store could not be created");
+        };
+        let id = ContactId::from_bytes([0x81; 16]);
+        let (session, _) = established_sessions();
+        let mut new_contact = contact(id);
+        new_contact.display_name = "contact-plaintext-marker-4f83".to_owned();
+        assert!(store.add_active_contact(new_contact, &session).is_ok());
+        let mut candidate = store.load_session(id);
+        let Ok(ref mut candidate) = candidate else {
+            panic!("test session could not be restored");
+        };
+        assert!(candidate.encrypt(b"ratchet advance").is_ok());
+        let envelope = b"outbox-plaintext-marker-819d";
+        assert!(
+            store
+                .commit_outgoing(id, candidate, [0x82; 16], envelope)
+                .is_ok()
+        );
+        drop(store);
+
+        let bytes = fs::read(temporary.path());
+        let Ok(bytes) = bytes else {
+            panic!("encrypted database file could not be read");
+        };
+        for marker in [
+            b"contact-plaintext-marker-4f83".as_slice(),
+            b"outbox-plaintext-marker-819d".as_slice(),
+        ] {
+            assert!(!bytes.windows(marker.len()).any(|window| window == marker));
+        }
+    }
+}
