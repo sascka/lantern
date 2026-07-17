@@ -5,6 +5,7 @@ members = [
     "crates/lantern-core",
     "crates/lantern-crypto",
     "crates/lantern-diagnostics",
+    "crates/lantern-lan",
     "crates/lantern-node",
     "crates/lantern-secret-storage",
     "crates/lantern-storage",

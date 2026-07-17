@@ -437,6 +437,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lantern-lan"
+version = "0.1.0"
+
+[[package]]
 name = "lantern-node"
 version = "0.1.0"
 dependencies = [
