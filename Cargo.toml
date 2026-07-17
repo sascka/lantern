@@ -5,6 +5,7 @@ members = [
     "crates/lantern-core",
     "crates/lantern-diagnostics",
     "crates/lantern-storage",
+    "crates/lantern-time",
 ]
 resolver = "3"
 

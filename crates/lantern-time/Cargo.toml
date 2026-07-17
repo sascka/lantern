@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MPL-2.0
+
+[package]
+name = "lantern-time"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Monotonic runtime time policy for Lantern"
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+lantern-core = { path = "../lantern-core" }
+lantern-diagnostics = { path = "../lantern-diagnostics" }
