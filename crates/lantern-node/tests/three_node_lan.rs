@@ -105,6 +105,21 @@ fn connect_encounter(node: &mut NodeRuntime, peer: PeerAddress) -> EncounterSumm
     summary
 }
 
+fn transfer_once(sender_path: &Path, receiver_path: &Path) -> (EncounterSummary, EncounterSummary) {
+    let (listener, peer) = listener_and_peer();
+    let sender_path = sender_path.to_path_buf();
+    let sender = thread::spawn(move || {
+        let mut sender = start_node(&sender_path);
+        connect_encounter(&mut sender, peer)
+    });
+    let mut receiver = start_node(receiver_path);
+    let received = accept_encounter(&mut receiver, &listener);
+    let sent = sender
+        .join()
+        .unwrap_or_else(|_| panic!("Wait sender thread should not panic"));
+    (sent, received)
+}
+
 #[test]
 fn envelope_crosses_restarted_relay_without_alice_bob_connection() {
     let alice_database = TestDatabase::new("alice");
@@ -253,4 +268,45 @@ fn relay_cannot_forward_after_the_only_hop_is_spent() {
     assert_eq!(relay_summary.sent().transferred(), 0);
     assert_eq!(bob_summary.received().transferred(), 0);
     assert!(bob.queue().get(identifier).is_none());
+}
+
+#[test]
+fn last_wait_copy_is_not_offered_to_an_unknown_peer() {
+    let databases: [TestDatabase; 7] =
+        std::array::from_fn(|index| TestDatabase::new(&format!("wait-{index}")));
+    let envelope = synthetic_envelope(16);
+    let identifier = envelope.message_id();
+
+    let mut origin = start_node(databases[0].path());
+    origin
+        .enqueue_origin(envelope)
+        .unwrap_or_else(|_| panic!("Wait fixture should enter the origin queue"));
+    drop(origin);
+
+    for index in 0..5 {
+        let (sent, received) = transfer_once(databases[index].path(), databases[index + 1].path());
+        assert_eq!(sent.sent().transferred(), 1);
+        assert_eq!(received.received().transferred(), 1);
+    }
+
+    let (wait_sender, unknown_receiver) = transfer_once(databases[5].path(), databases[6].path());
+    assert_eq!(wait_sender.sent().offered(), 0);
+    assert_eq!(wait_sender.sent().transferred(), 0);
+    assert_eq!(unknown_receiver.received().transferred(), 0);
+
+    let expected_routes = [(0, 16), (1, 8), (2, 4), (3, 2), (4, 1), (5, 1)];
+    let mut total_copies = 0;
+    for (index, expected) in expected_routes.into_iter().enumerate() {
+        let node = start_node(databases[index].path());
+        let route = node
+            .queue()
+            .get(identifier)
+            .map(|entry| (entry.route().hops_taken(), entry.route().copies_left()));
+        assert_eq!(route, Some(expected));
+        total_copies += expected.1;
+    }
+    assert_eq!(total_copies, 32);
+
+    let unknown = start_node(databases[6].path());
+    assert!(unknown.queue().get(identifier).is_none());
 }

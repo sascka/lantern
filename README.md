@@ -98,6 +98,8 @@ Length-prefixed framing и общий deadline кадра записаны в
 [ADR 0027](docs/adr/0027-persistent-verified-endpoint-contacts.md).
 Зашифрованный happy path Alice -> Relay -> Bob описан в
 [ADR 0028](docs/adr/0028-encrypted-three-node-happy-path.md).
+Wait-фаза, изменение защищённых полей и повторный показ проверены в
+[ADR 0029](docs/adr/0029-wait-and-tamper-negative-path.md).
 Исходные данные находятся в
 [обзоре криптографии](docs/research/CRYPTOGRAPHY_REVIEW.md) и
 [результатах эксперимента](experiments/vodozemac-compat/RESULTS.md).
@@ -237,7 +239,9 @@ wire framing. `lantern-sync` работает поверх этой границ
 строк в обеих SQLite-базах и отсутствие payload и полных ID в файле постоянной
 диагностики. Отдельные криптографические тесты проверяют строгие vectors,
 подмену внешнего Envelope, replay, перестановку 32 сообщений и восстановление
-outbox. Эти проверки ничего не доказывают о будущей сети и не заменяют аудит.
+outbox. Этап 4 дополнительно проверяет подмену полей на границе очереди и crypto,
+откат кандидатного ratchet и последнюю Wait-копию в настоящих LAN-встречах.
+Эти проверки не являются доказательством безопасности и не заменяют аудит.
 
 ## Участие в разработке
 

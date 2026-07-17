@@ -10,7 +10,7 @@ use lantern_bridge::{
     BridgeError, IncomingChatResult, export_pending_outbox, process_incoming_chat,
 };
 use lantern_core::{EnqueueOutcome, Envelope, QueueLimits};
-use lantern_crypto::{decrypt_chat, encrypt_chat};
+use lantern_crypto::{CryptoError, decrypt_chat, encrypt_chat};
 use lantern_diagnostics::JournalLimits;
 use lantern_node::{NodeError, NodeRuntime};
 use lantern_secret_storage::{ContactId, KdfHeader, NewContact, Passphrase, SecretStore};
@@ -331,4 +331,136 @@ fn unknown_recipient_hint_is_left_for_forwarding_without_crypto_attempt() {
     ));
     assert!(node.queue().get(identifier).is_some());
     assert_eq!(contacts.bob.has_received_chat([0x51; 16]), Ok(false));
+}
+
+#[test]
+fn protected_changes_are_rejected_without_committing_the_candidate_ratchet() {
+    let alice_path = TestPath::new("tamper-alice");
+    let bob_path = TestPath::new("tamper-bob");
+    let node_path = TestPath::new("tamper-node");
+    let mut contacts = contact_stores(alice_path.path(), bob_path.path());
+    let mut node = start_node(node_path.path());
+
+    let mut originals = Vec::new();
+    for text in [
+        "outer identifier fixture",
+        "ttl fixture",
+        "hop limit fixture",
+        "ciphertext fixture",
+        "later valid message",
+    ] {
+        originals.push(
+            encrypt_chat(
+                &mut contacts.alice,
+                contacts.alice_contact,
+                text.to_owned(),
+                3600,
+                4,
+            )
+            .unwrap_or_else(|_| panic!("tamper fixture should be encrypted")),
+        );
+    }
+
+    let first = &originals[0];
+    let changed_identifier = Envelope::try_from_fields(
+        first.protocol_version(),
+        [0xd1; 16],
+        *first.recipient_hint().as_bytes(),
+        u64::from(first.ttl_seconds().get()),
+        u64::from(first.max_hops().get()),
+        first.priority().as_raw(),
+        first.protected_payload().as_bytes().to_vec(),
+    )
+    .unwrap_or_else(|_| panic!("changed identifier fixture should be valid"));
+
+    let second = &originals[1];
+    let changed_ttl = Envelope::try_from_fields(
+        second.protocol_version(),
+        *second.message_id().as_bytes(),
+        *second.recipient_hint().as_bytes(),
+        u64::from(second.ttl_seconds().get()) + 1,
+        u64::from(second.max_hops().get()),
+        second.priority().as_raw(),
+        second.protected_payload().as_bytes().to_vec(),
+    )
+    .unwrap_or_else(|_| panic!("changed TTL fixture should be valid"));
+
+    let third = &originals[2];
+    let changed_hop_limit = Envelope::try_from_fields(
+        third.protocol_version(),
+        *third.message_id().as_bytes(),
+        *third.recipient_hint().as_bytes(),
+        u64::from(third.ttl_seconds().get()),
+        u64::from(third.max_hops().get()) - 1,
+        third.priority().as_raw(),
+        third.protected_payload().as_bytes().to_vec(),
+    )
+    .unwrap_or_else(|_| panic!("changed hop limit fixture should be valid"));
+
+    let fourth = &originals[3];
+    let mut damaged_payload = fourth.protected_payload().as_bytes().to_vec();
+    let last = damaged_payload
+        .last_mut()
+        .unwrap_or_else(|| panic!("protected payload should not be empty"));
+    *last ^= 1;
+    let changed_payload = Envelope::try_from_fields(
+        fourth.protocol_version(),
+        *fourth.message_id().as_bytes(),
+        *fourth.recipient_hint().as_bytes(),
+        u64::from(fourth.ttl_seconds().get()),
+        u64::from(fourth.max_hops().get()),
+        fourth.priority().as_raw(),
+        damaged_payload,
+    )
+    .unwrap_or_else(|_| panic!("changed payload fixture should be valid"));
+
+    for (envelope, expected_error) in [
+        (changed_identifier, CryptoError::EnvelopeMismatch),
+        (changed_ttl, CryptoError::EnvelopeMismatch),
+        (changed_hop_limit, CryptoError::EnvelopeMismatch),
+        (changed_payload, CryptoError::OlmRejected),
+    ] {
+        let identifier = envelope.message_id();
+        assert_eq!(
+            node.enqueue_origin(envelope)
+                .unwrap_or_else(|_| panic!("tampered Envelope should enter the test queue"))
+                .outcome(),
+            EnqueueOutcome::Stored
+        );
+        let result = process_incoming_chat(&mut contacts.bob, &mut node, identifier);
+        assert!(matches!(
+            result,
+            Err(BridgeError::Crypto(error)) if error == expected_error
+        ));
+        assert!(node.queue().get(identifier).is_some());
+        assert_eq!(
+            contacts.bob.has_received_chat(*identifier.as_bytes()),
+            Ok(false)
+        );
+    }
+
+    let valid = originals
+        .pop()
+        .unwrap_or_else(|| panic!("later valid fixture should exist"));
+    let valid_identifier = valid.message_id();
+    node.enqueue_origin(valid.clone())
+        .unwrap_or_else(|_| panic!("later valid message should enter Bob's queue"));
+    let opened = process_incoming_chat(&mut contacts.bob, &mut node, valid_identifier)
+        .unwrap_or_else(|_| panic!("later valid message should still open"));
+    let IncomingChatResult::Opened(chat) = opened else {
+        panic!("later valid message should return its text");
+    };
+    assert_eq!(chat.text(), "later valid message");
+    drop(chat);
+
+    assert_eq!(
+        node.enqueue_origin(valid)
+            .unwrap_or_else(|_| panic!("replay should be checked against the tombstone"))
+            .outcome(),
+        EnqueueOutcome::DuplicateTombstone
+    );
+    assert!(matches!(
+        process_incoming_chat(&mut contacts.bob, &mut node, valid_identifier),
+        Ok(IncomingChatResult::Missing)
+    ));
 }
