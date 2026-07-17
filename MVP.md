@@ -271,7 +271,8 @@ Olm-оболочка, внутренний CBOR и транзакционная 
 Постоянные profile, contact и pending-contact bucket зафиксированы в
 `CRYPTO_LIMITS.md` и ADR 0016. Реализации limiter пока нет.
 Отдельная SQLCipher-база, Argon2id и transactional outbox зафиксированы в
-`SECRET_STORAGE.md` и ADR 0017. Реализации секретного хранилища пока нет.
+`SECRET_STORAGE.md` и ADR 0017. Строгий KDF header и Argon2id уже реализованы в
+`lantern-secret-storage`. SQLCipher и секретная SQL-схема пока не подключены.
 
 Строгая конфигурация CBOR, FIFO-вытеснение общей очереди, SQLite-хранилище и
 консервативное истечение активной очереди при откате часов уже выбраны в ADR
