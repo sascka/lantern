@@ -42,6 +42,11 @@ production и пока не разрешает передавать настоя
 Постоянные лимиты попыток decrypt зафиксированы в
 [CRYPTO_LIMITS.md](CRYPTO_LIMITS.md) и
 [ADR 0016](docs/adr/0016-persistent-crypto-attempt-limits.md).
+Отдельная SQLCipher-база, Argon2id для парольной фразы и атомарная граница
+между ratchet state и открытой очередью зафиксированы в
+[SECRET_STORAGE.md](SECRET_STORAGE.md) и
+[ADR 0017](docs/adr/0017-sqlcipher-secret-storage-with-argon2id.md).
+Хранилище пока не реализовано и не подключено к runtime.
 Исходные данные находятся в
 [обзоре криптографии](docs/research/CRYPTOGRAPHY_REVIEW.md) и
 [результатах эксперимента](experiments/vodozemac-compat/RESULTS.md).
@@ -106,14 +111,16 @@ Android, группы, карты, SOS, интернет-реле, Tor, BLE, Wi-
    `recipient_hint`.
 7. [PAYLOAD.md](PAYLOAD.md) - Olm-оболочка и внутренние сообщения.
 8. [CRYPTO_LIMITS.md](CRYPTO_LIMITS.md) - постоянные лимиты попыток decrypt.
-9. [PRIVACY.md](PRIVACY.md) - локальные данные, метаданные и сроки хранения.
-10. [SECURITY.md](SECURITY.md) - правила безопасной разработки и выпуска версий.
-11. [LICENSES.md](LICENSES.md) - лицензии разных частей проекта и правила для
+9. [SECRET_STORAGE.md](SECRET_STORAGE.md) - пароль, секретная база и атомарное
+   хранение ratchet.
+10. [PRIVACY.md](PRIVACY.md) - локальные данные, метаданные и сроки хранения.
+11. [SECURITY.md](SECURITY.md) - правила безопасной разработки и выпуска версий.
+12. [LICENSES.md](LICENSES.md) - лицензии разных частей проекта и правила для
    зависимостей.
-12. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) - версии и уведомления
+13. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) - версии и уведомления
    сторонних зависимостей.
-13. [CONTRIBUTING.md](CONTRIBUTING.md) - порядок внесения и проверки изменений.
-14. [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - правила общения и модерации.
+14. [CONTRIBUTING.md](CONTRIBUTING.md) - порядок внесения и проверки изменений.
+15. [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - правила общения и модерации.
 
 Если документы противоречат друг другу, работу нужно остановить и сначала
 исправить спецификацию. Нельзя молча выбирать более удобный вариант в коде.

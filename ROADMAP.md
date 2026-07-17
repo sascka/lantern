@@ -460,7 +460,16 @@ Compatibility-эксперимент завершён 17 июля 2026 года.
 `CRYPTO_LIMITS.md` и `docs/adr/0016-persistent-crypto-attempt-limits.md`.
 Выбраны связанные profile, contact и pending-contact token bucket,
 резервирование до decrypt и отсутствие offline refill после перезапуска.
-Limiter пока не реализован и зависит от будущего секретного хранилища.
+Limiter пока не реализован и зависит от ещё не написанного секретного
+хранилища.
+
+Архитектура секретного хранилища зафиксирована 17 июля 2026 года в
+`SECRET_STORAGE.md` и
+`docs/adr/0017-sqlcipher-secret-storage-with-argon2id.md`. Выбраны отдельная
+SQLCipher-база, Argon2id с профилем RFC 9106, terminal passphrase,
+transactional pending outbox и постоянный marker начатой decrypt. Системный
+keyring не является обязательным. Код хранилища и новые зависимости пока не
+добавлены.
 
 ## Этап 3 - два устройства в LAN
 
