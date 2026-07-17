@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[package]
+name = "lantern-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "AGPL-3.0-or-later"
+description = "Experimental Linux command line client for Lantern"
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lantern-bridge = { path = "../../crates/lantern-bridge" }
+lantern-core = { path = "../../crates/lantern-core" }
+lantern-crypto = { path = "../../crates/lantern-crypto" }
+lantern-diagnostics = { path = "../../crates/lantern-diagnostics" }
+lantern-lan = { path = "../../crates/lantern-lan" }
+lantern-node = { path = "../../crates/lantern-node" }
+lantern-secret-storage = { path = "../../crates/lantern-secret-storage" }
+lantern-transport = { path = "../../crates/lantern-transport" }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
