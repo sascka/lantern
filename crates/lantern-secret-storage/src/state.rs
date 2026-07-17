@@ -119,6 +119,41 @@ impl LimiterRuntime {
 }
 
 impl SecretStore {
+    pub fn contact_for_inbound_hint(
+        &self,
+        recipient_hint: [u8; 16],
+    ) -> Result<Option<ContactId>, SecretStorageError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT contact_id FROM contacts
+                 WHERE state = 3 AND (
+                    inbound_current_hint = ?1
+                    OR inbound_proposed_hint = ?1
+                    OR inbound_retiring_hint = ?1
+                 )
+                 ORDER BY contact_id LIMIT 2",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map(params![recipient_hint.as_slice()], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(database_error)?;
+        let mut matches = Vec::with_capacity(2);
+        for row in rows {
+            let bytes = row.map_err(database_error)?;
+            let bytes = <[u8; CONTACT_ID_LENGTH]>::try_from(bytes)
+                .map_err(|_| SecretStorageError::CorruptStorage)?;
+            matches.push(ContactId::from_bytes(bytes));
+        }
+        match matches.as_slice() {
+            [] => Ok(None),
+            [contact_id] => Ok(Some(*contact_id)),
+            _ => Err(SecretStorageError::CorruptStorage),
+        }
+    }
+
     pub fn outbound_recipient_hint(
         &self,
         contact_id: ContactId,
@@ -459,6 +494,48 @@ impl SecretStore {
             });
         }
         Ok(output)
+    }
+
+    pub fn next_pending_outbox(&self) -> Result<Option<PendingEnvelope>, SecretStorageError> {
+        let row: Option<(Vec<u8>, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT message_id, envelope_cbor FROM pending_outbox
+                 ORDER BY sequence LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(database_error)?;
+        let Some((message_id, envelope_cbor)) = row else {
+            return Ok(None);
+        };
+        if envelope_cbor.is_empty() || envelope_cbor.len() > MAX_ENVELOPE_BYTES {
+            return Err(SecretStorageError::CorruptStorage);
+        }
+        let message_id = <[u8; MESSAGE_ID_LENGTH]>::try_from(message_id)
+            .map_err(|_| SecretStorageError::CorruptStorage)?;
+        Ok(Some(PendingEnvelope {
+            message_id,
+            envelope_cbor: envelope_cbor.into_boxed_slice(),
+        }))
+    }
+
+    pub fn has_received_chat(
+        &self,
+        message_id: [u8; MESSAGE_ID_LENGTH],
+    ) -> Result<bool, SecretStorageError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM messages
+                    WHERE message_id = ?1 AND direction = 0
+                 )",
+                params![message_id.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists == 1)
+            .map_err(database_error)
     }
 
     pub fn remove_pending_outbox(

@@ -2,6 +2,7 @@
 
 [workspace]
 members = [
+    "crates/lantern-bridge",
     "crates/lantern-core",
     "crates/lantern-crypto",
     "crates/lantern-diagnostics",

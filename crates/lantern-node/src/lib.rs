@@ -14,5 +14,6 @@ pub use clock::NodeClock;
 pub use error::NodeError;
 pub use profile_lock::ProfileLockError;
 pub use runtime::{
-    EncounterRole, EncounterSummary, NodeEnqueueReport, NodeMaintenance, NodeRuntime, NodeState,
+    EncounterRole, EncounterSummary, NodeEnqueueReport, NodeMaintenance, NodeOpenReport,
+    NodeRuntime, NodeState,
 };

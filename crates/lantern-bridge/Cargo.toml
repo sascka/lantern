@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MPL-2.0
+
+[package]
+name = "lantern-bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transactional boundary between Lantern cryptography and its open queue"
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lantern-core = { path = "../lantern-core" }
+lantern-crypto = { path = "../lantern-crypto" }
+lantern-node = { path = "../lantern-node" }
+lantern-secret-storage = { path = "../lantern-secret-storage" }
+
+[dev-dependencies]
+lantern-diagnostics = { path = "../lantern-diagnostics" }
+vodozemac = { version = "=0.10.0", default-features = false }

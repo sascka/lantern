@@ -134,6 +134,22 @@ impl NodeEnqueueReport {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeOpenReport {
+    opened: bool,
+    maintenance: NodeMaintenance,
+}
+
+impl NodeOpenReport {
+    pub const fn opened(self) -> bool {
+        self.opened
+    }
+
+    pub const fn maintenance(self) -> NodeMaintenance {
+        self.maintenance
+    }
+}
+
 pub struct NodeRuntime<C = SystemRuntimeClock> {
     state: NodeState,
     clock: C,
@@ -316,6 +332,26 @@ impl<C: NodeClock> NodeRuntime<C> {
         }
         Ok(NodeEnqueueReport {
             outcome,
+            maintenance,
+        })
+    }
+
+    pub fn complete_opened(&mut self, message_id: MessageId) -> Result<NodeOpenReport, NodeError> {
+        let (now, mut maintenance) = self.observe_time()?;
+        let effects = match self.queue.remove_opened(message_id, now) {
+            Ok(effects) => effects,
+            Err(error) => return self.fail(error.into()),
+        };
+        let opened = effects
+            .removed_entries()
+            .iter()
+            .any(|entry| entry.route().state() == ContainerState::Opened);
+        maintenance.include_queue_effects(&effects);
+        if let Err(error) = self.store.save(&self.queue, now) {
+            return self.fail(error.into());
+        }
+        Ok(NodeOpenReport {
+            opened,
             maintenance,
         })
     }
