@@ -14,6 +14,11 @@ pub use journal::{
     DEFAULT_JOURNAL_LOGICAL_BYTES, DEFAULT_JOURNAL_RECORDS, DiagnosticJournal, DiagnosticRecord,
     JournalLimits, JournalMaintenance, JournalView, RecordResult,
 };
+#[cfg(feature = "persistence")]
+pub use journal::{
+    MAX_DIAGNOSTIC_FILE_BYTES, PersistentDiagnosticError, PersistentDiagnosticJournal,
+    PersistentDiagnosticRecovery,
+};
 
 /// Maximum number of records accepted by one journal configuration.
 pub const MAX_JOURNAL_RECORDS: usize = 10_000;

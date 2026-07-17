@@ -9,6 +9,14 @@ use crate::{
     MIN_JOURNAL_RETENTION_SECONDS, SizeBucket,
 };
 
+#[cfg(feature = "persistence")]
+mod persistence;
+#[cfg(feature = "persistence")]
+pub use persistence::{
+    MAX_DIAGNOSTIC_FILE_BYTES, PersistentDiagnosticError, PersistentDiagnosticJournal,
+    PersistentDiagnosticRecovery,
+};
+
 pub const DEFAULT_JOURNAL_RECORDS: usize = 2_048;
 pub const DEFAULT_JOURNAL_LOGICAL_BYTES: usize =
     DEFAULT_JOURNAL_RECORDS * DIAGNOSTIC_RECORD_LOGICAL_BYTES;
@@ -162,6 +170,7 @@ impl RecordResult {
     }
 }
 
+#[derive(Clone)]
 struct StoredRecord {
     record: DiagnosticRecord,
     expires_at: u64,

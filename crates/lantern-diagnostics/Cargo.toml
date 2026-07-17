@@ -12,3 +12,10 @@ publish = false
 
 [lints]
 workspace = true
+
+[features]
+default = []
+persistence = ["dep:rusqlite"]
+
+[dependencies]
+rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled", "limits"], optional = true }
