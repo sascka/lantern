@@ -36,6 +36,7 @@ pub enum EventOutcome {
     QuotaReached,
     UnsupportedVersion,
     StorageFailure,
+    TransportFailure,
     ClockRollback,
 }
 

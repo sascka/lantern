@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MPL-2.0
+
+[package]
+name = "lantern-transport"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded transport interface for opaque Lantern frames"
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+lantern-core = { path = "../lantern-core" }

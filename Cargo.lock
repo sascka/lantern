@@ -64,6 +64,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lantern-transport"
+version = "0.1.0"
+dependencies = [
+ "lantern-core",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.38.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
