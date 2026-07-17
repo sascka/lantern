@@ -414,8 +414,10 @@ dependencies = [
  "lantern-core",
  "lantern-crypto",
  "lantern-diagnostics",
+ "lantern-lan",
  "lantern-node",
  "lantern-secret-storage",
+ "lantern-transport",
  "vodozemac",
 ]
 

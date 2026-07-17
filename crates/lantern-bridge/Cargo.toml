@@ -21,4 +21,6 @@ lantern-secret-storage = { path = "../lantern-secret-storage" }
 
 [dev-dependencies]
 lantern-diagnostics = { path = "../lantern-diagnostics" }
+lantern-lan = { path = "../lantern-lan" }
+lantern-transport = { path = "../lantern-transport" }
 vodozemac = { version = "=0.10.0", default-features = false }
