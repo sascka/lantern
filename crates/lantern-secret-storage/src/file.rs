@@ -13,6 +13,14 @@ use crate::{KDF_HEADER_MAX_BYTES, KdfHeader, SecretStorageError};
 
 pub fn create_kdf_header_file(path: &Path) -> Result<KdfHeader, SecretStorageError> {
     let header = KdfHeader::generate()?;
+    write_kdf_header_file(path, &header)?;
+    Ok(header)
+}
+
+pub(crate) fn write_kdf_header_file(
+    path: &Path,
+    header: &KdfHeader,
+) -> Result<(), SecretStorageError> {
     let encoded = header.encode()?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -20,8 +28,7 @@ pub fn create_kdf_header_file(path: &Path) -> Result<KdfHeader, SecretStorageErr
 
     let mut file = options.open(path).map_err(map_create_error)?;
     write_and_sync(&mut file, &encoded)?;
-
-    Ok(header)
+    Ok(())
 }
 
 pub fn read_kdf_header_file(path: &Path) -> Result<KdfHeader, SecretStorageError> {

@@ -14,6 +14,14 @@ pub enum SecretStorageError {
     UnsafeFile,
     Io,
     UnsupportedPlatform,
+    UnlockFailed,
+    UnsupportedSchema,
+    CorruptStorage,
+    QuotaExceeded,
+    IncompleteProfile,
+    UnknownContact,
+    RateLimited,
+    AttemptAlreadyProcessed,
 }
 
 impl fmt::Display for SecretStorageError {
@@ -31,6 +39,18 @@ impl fmt::Display for SecretStorageError {
             Self::UnsafeFile => formatter.write_str("KDF header file is unsafe"),
             Self::Io => formatter.write_str("KDF header file operation failed"),
             Self::UnsupportedPlatform => formatter.write_str("platform is not supported by v0.1"),
+            Self::UnlockFailed => formatter.write_str("secret storage could not be unlocked"),
+            Self::UnsupportedSchema => formatter.write_str("secret storage schema is unsupported"),
+            Self::CorruptStorage => formatter.write_str("secret storage is invalid"),
+            Self::QuotaExceeded => formatter.write_str("secret storage quota is full"),
+            Self::IncompleteProfile => formatter.write_str("secret profile is incomplete"),
+            Self::UnknownContact => formatter.write_str("contact is unknown"),
+            Self::RateLimited => {
+                formatter.write_str("cryptographic processing is temporarily limited")
+            }
+            Self::AttemptAlreadyProcessed => {
+                formatter.write_str("cryptographic attempt was already processed")
+            }
         }
     }
 }

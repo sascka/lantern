@@ -201,6 +201,17 @@ pub struct DatabaseKey {
     bytes: [u8; DATABASE_KEY_LENGTH],
 }
 
+impl DatabaseKey {
+    #[cfg(test)]
+    pub(crate) const fn from_bytes(bytes: [u8; DATABASE_KEY_LENGTH]) -> Self {
+        Self { bytes }
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; DATABASE_KEY_LENGTH] {
+        &self.bytes
+    }
+}
+
 impl Drop for DatabaseKey {
     fn drop(&mut self) {
         self.bytes.zeroize();
