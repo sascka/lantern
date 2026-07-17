@@ -36,6 +36,9 @@ production и пока не разрешает передавать настоя
 Формат двух контактных QR, очная SAS-проверка и смена `recipient_hint`
 зафиксированы в [CONTACTS.md](CONTACTS.md) и
 [ADR 0014](docs/adr/0014-two-qr-contact-verification-and-hint-rotation.md).
+Строгая Olm-оболочка, семь внутренних типов и правило кандидатного ratchet
+зафиксированы в [PAYLOAD.md](PAYLOAD.md) и
+[ADR 0015](docs/adr/0015-versioned-olm-payload-and-transactional-ratchet.md).
 Исходные данные находятся в
 [обзоре криптографии](docs/research/CRYPTOGRAPHY_REVIEW.md) и
 [результатах эксперимента](experiments/vodozemac-compat/RESULTS.md).
@@ -98,14 +101,15 @@ Android, группы, карты, SOS, интернет-реле, Tor, BLE, Wi-
    контейнера.
 6. [CONTACTS.md](CONTACTS.md) - контактные QR, SAS-проверка и смена
    `recipient_hint`.
-7. [PRIVACY.md](PRIVACY.md) - локальные данные, метаданные и сроки хранения.
-8. [SECURITY.md](SECURITY.md) - правила безопасной разработки и выпуска версий.
-9. [LICENSES.md](LICENSES.md) - лицензии разных частей проекта и правила для
+7. [PAYLOAD.md](PAYLOAD.md) - Olm-оболочка и внутренние сообщения.
+8. [PRIVACY.md](PRIVACY.md) - локальные данные, метаданные и сроки хранения.
+9. [SECURITY.md](SECURITY.md) - правила безопасной разработки и выпуска версий.
+10. [LICENSES.md](LICENSES.md) - лицензии разных частей проекта и правила для
    зависимостей.
-10. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) - версии и уведомления
+11. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) - версии и уведомления
    сторонних зависимостей.
-11. [CONTRIBUTING.md](CONTRIBUTING.md) - порядок внесения и проверки изменений.
-12. [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - правила общения и модерации.
+12. [CONTRIBUTING.md](CONTRIBUTING.md) - порядок внесения и проверки изменений.
+13. [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - правила общения и модерации.
 
 Если документы противоречат друг другу, работу нужно остановить и сначала
 исправить спецификацию. Нельзя молча выбирать более удобный вариант в коде.
