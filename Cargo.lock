@@ -477,6 +477,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lantern-sync"
+version = "0.1.0"
+dependencies = [
+ "lantern-core",
+ "lantern-lan",
+ "lantern-transport",
+ "proptest",
+]
+
+[[package]]
 name = "lantern-time"
 version = "0.1.0"
 dependencies = [

@@ -9,6 +9,7 @@ members = [
     "crates/lantern-node",
     "crates/lantern-secret-storage",
     "crates/lantern-storage",
+    "crates/lantern-sync",
     "crates/lantern-time",
     "crates/lantern-transport",
 ]
