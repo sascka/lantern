@@ -15,11 +15,13 @@ use crate::{SecretStorageError, SecretStore, database::database_error};
 const CONTACT_ID_LENGTH: usize = 16;
 const MESSAGE_ID_LENGTH: usize = 16;
 const MAX_CONTACTS: i64 = 128;
+const MAX_CONTACT_ENTRIES: usize = 128;
 const MAX_ATTEMPTS: i64 = 2000;
 const MAX_OUTBOX: i64 = 1000;
 const MAX_OUTBOX_ENTRIES: usize = 1000;
 const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 const MAX_HISTORY: i64 = 8192;
+const MAX_HISTORY_ENTRIES: usize = 8192;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_PICKLE_BYTES: usize = 64 * 1024;
 const PROFILE_CAPACITY: i64 = 32;
@@ -129,6 +131,31 @@ pub struct PendingEnvelope {
     envelope_cbor: Box<[u8]>,
 }
 
+pub struct ReceivedMessage {
+    contact_id: ContactId,
+    text: Zeroizing<String>,
+}
+
+impl ReceivedMessage {
+    pub const fn contact_id(&self) -> ContactId {
+        self.contact_id
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Debug for ReceivedMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReceivedMessage")
+            .field("contact_id", &"redacted")
+            .field("text_length", &self.text.len())
+            .finish()
+    }
+}
+
 impl PendingEnvelope {
     pub const fn message_id(&self) -> &[u8; MESSAGE_ID_LENGTH] {
         &self.message_id
@@ -167,6 +194,60 @@ impl LimiterRuntime {
 }
 
 impl SecretStore {
+    pub fn active_contacts(&self) -> Result<Vec<ActiveContact>, SecretStorageError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT contact_id, display_name, signing_identity_key, curve_identity_key,
+                        inbound_current_hint, outbound_current_hint
+                 FROM contacts WHERE state = 3
+                 ORDER BY display_name, contact_id LIMIT 129",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            })
+            .map_err(database_error)?;
+        let mut contacts = Vec::new();
+        for row in rows {
+            if contacts.len() >= MAX_CONTACT_ENTRIES {
+                return Err(SecretStorageError::CorruptStorage);
+            }
+            let (contact_id, display_name, signing_key, curve_key, inbound_hint, outbound_hint) =
+                row.map_err(database_error)?;
+            validate_display_name(&display_name)?;
+            contacts.push(ActiveContact {
+                contact_id: ContactId::from_bytes(
+                    contact_id
+                        .try_into()
+                        .map_err(|_| SecretStorageError::CorruptStorage)?,
+                ),
+                display_name,
+                signing_identity_key: signing_key
+                    .try_into()
+                    .map_err(|_| SecretStorageError::CorruptStorage)?,
+                curve_identity_key: curve_key
+                    .try_into()
+                    .map_err(|_| SecretStorageError::CorruptStorage)?,
+                inbound_recipient_hint: inbound_hint
+                    .try_into()
+                    .map_err(|_| SecretStorageError::CorruptStorage)?,
+                outbound_recipient_hint: outbound_hint
+                    .try_into()
+                    .map_err(|_| SecretStorageError::CorruptStorage)?,
+            });
+        }
+        Ok(contacts)
+    }
+
     pub fn active_contact(
         &self,
         contact_id: ContactId,
@@ -667,6 +748,41 @@ impl SecretStore {
             )
             .map(|exists| exists == 1)
             .map_err(database_error)
+    }
+
+    pub fn received_messages(&self) -> Result<Vec<ReceivedMessage>, SecretStorageError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT contact_id, text FROM messages
+                 WHERE direction = 0 ORDER BY sequence LIMIT 8193",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(database_error)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            if messages.len() >= MAX_HISTORY_ENTRIES {
+                return Err(SecretStorageError::CorruptStorage);
+            }
+            let (contact_id, text) = row.map_err(database_error)?;
+            if text.is_empty() || text.len() > MAX_TEXT_BYTES || text.chars().any(char::is_control)
+            {
+                return Err(SecretStorageError::CorruptStorage);
+            }
+            messages.push(ReceivedMessage {
+                contact_id: ContactId::from_bytes(
+                    contact_id
+                        .try_into()
+                        .map_err(|_| SecretStorageError::CorruptStorage)?,
+                ),
+                text: Zeroizing::new(text),
+            });
+        }
+        Ok(messages)
     }
 
     pub fn remove_pending_outbox(
