@@ -239,6 +239,112 @@ fn node_persists_an_origin_envelope_across_restart() {
 }
 
 #[test]
+fn normal_restart_expires_due_envelope_and_keeps_its_tombstone() {
+    let database = TestDatabase::new("restart-expiry");
+    let envelope = envelope(0x12, 60);
+    let identifier = envelope.message_id();
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101)]);
+    let mut runtime = NodeRuntime::start_with_clock(
+        database.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    )
+    .unwrap_or_else(|_| panic!("node should start before the TTL boundary"));
+    assert_eq!(
+        runtime
+            .enqueue_origin(envelope.clone())
+            .unwrap_or_else(|_| panic!("short-lived Envelope should be stored"))
+            .outcome(),
+        EnqueueOutcome::Stored
+    );
+    drop(runtime);
+
+    let (clock, _) = ScriptedClock::new(161, &[(0, 161), (1, 162)]);
+    let mut recovered = NodeRuntime::start_with_clock(
+        database.path(),
+        queue_limits(),
+        JournalLimits::default(),
+        clock,
+    )
+    .unwrap_or_else(|_| panic!("node should recover at the TTL boundary"));
+    assert_eq!(
+        recovered.startup_recovery().clock_recovery(),
+        ClockRecovery::Normal
+    );
+    assert_eq!(recovered.startup_recovery().expired_entries(), 1);
+    assert!(recovered.queue().get(identifier).is_none());
+    assert_eq!(recovered.queue().tombstone_count(), 1);
+    assert_eq!(
+        recovered
+            .enqueue_origin(envelope)
+            .unwrap_or_else(|_| panic!("expired replay should be checked"))
+            .outcome(),
+        EnqueueOutcome::DuplicateTombstone
+    );
+}
+
+#[test]
+fn count_quota_eviction_and_tombstone_survive_restart() {
+    let database = TestDatabase::new("restart-eviction");
+    let limits = QueueLimits::try_new(2, 256 * 1024, 4, 600)
+        .unwrap_or_else(|_| panic!("small eviction limits should be valid"));
+    let first = envelope(0x13, 300);
+    let first_id = first.message_id();
+    let second = envelope(0x14, 300);
+    let second_id = second.message_id();
+    let third = envelope(0x15, 300);
+    let third_id = third.message_id();
+    let (clock, _) = ScriptedClock::new(100, &[(0, 100), (1, 101), (2, 102), (3, 103)]);
+    let mut runtime =
+        NodeRuntime::start_with_clock(database.path(), limits, JournalLimits::default(), clock)
+            .unwrap_or_else(|_| panic!("node should start with a two-item queue"));
+    assert_eq!(
+        runtime
+            .enqueue_origin(first.clone())
+            .unwrap_or_else(|_| panic!("first eviction fixture should be stored"))
+            .outcome(),
+        EnqueueOutcome::Stored
+    );
+    assert_eq!(
+        runtime
+            .enqueue_origin(second)
+            .unwrap_or_else(|_| panic!("second eviction fixture should be stored"))
+            .outcome(),
+        EnqueueOutcome::Stored
+    );
+    let third_report = runtime
+        .enqueue_origin(third)
+        .unwrap_or_else(|_| panic!("third eviction fixture should be stored"));
+    assert_eq!(third_report.outcome(), EnqueueOutcome::Stored);
+    assert_eq!(third_report.maintenance().evicted_entries(), 1);
+    assert_eq!(runtime.queue().len(), 2);
+    assert!(runtime.queue().stored_bytes() <= limits.max_bytes());
+    assert!(runtime.queue().get(first_id).is_none());
+    assert!(runtime.queue().get(second_id).is_some());
+    assert!(runtime.queue().get(third_id).is_some());
+    assert_eq!(runtime.queue().tombstone_count(), 1);
+    drop(runtime);
+
+    let (clock, _) = ScriptedClock::new(110, &[(0, 110), (1, 111)]);
+    let mut recovered =
+        NodeRuntime::start_with_clock(database.path(), limits, JournalLimits::default(), clock)
+            .unwrap_or_else(|_| panic!("evicted queue should survive restart"));
+    assert_eq!(recovered.queue().len(), 2);
+    assert!(recovered.queue().get(second_id).is_some());
+    assert!(recovered.queue().get(third_id).is_some());
+    assert_eq!(recovered.queue().tombstone_count(), 1);
+    assert_eq!(
+        recovered
+            .enqueue_origin(first)
+            .unwrap_or_else(|_| panic!("evicted replay should be checked"))
+            .outcome(),
+        EnqueueOutcome::DuplicateTombstone
+    );
+    assert_eq!(recovered.queue().len(), 2);
+}
+
+#[test]
 fn restart_clock_rollback_expires_persisted_entries() {
     let database = TestDatabase::new("restart-rollback");
     let (clock, _) = ScriptedClock::new(1_000, &[(0, 1_000), (1, 1_001), (2, 1_002)]);

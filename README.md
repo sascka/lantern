@@ -100,6 +100,8 @@ Length-prefixed framing и общий deadline кадра записаны в
 [ADR 0028](docs/adr/0028-encrypted-three-node-happy-path.md).
 Wait-фаза, изменение защищённых полей и повторный показ проверены в
 [ADR 0029](docs/adr/0029-wait-and-tamper-negative-path.md).
+Перезапуск, TTL, квоты и восстановление между транзакциями собраны в
+[ADR 0030](docs/adr/0030-restart-expiry-and-transaction-recovery.md).
 Исходные данные находятся в
 [обзоре криптографии](docs/research/CRYPTOGRAPHY_REVIEW.md) и
 [результатах эксперимента](experiments/vodozemac-compat/RESULTS.md).
