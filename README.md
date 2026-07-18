@@ -49,7 +49,7 @@ SQLCipher-хранилище. Текущую версию всё равно мо
 последовательные LAN-встречи и открывают только профилем Bob. Replay, изменение
 полей, TTL, квоты, перезапуски и окна между транзакциями покрыты негативными
 тестами. Итоговая проверка прошла на чистом коммите
-`31bae2a49153833371138d34903a699885a18f03`, поэтому Этап 4 закрыт в границах
+`881e909ec4d594e80e41786b32c4a47a3de7f2d1`, поэтому Этап 4 закрыт в границах
 experimental preview.
 
 Для личных сообщений `Lantern v0.1 experimental preview` условно выбран
@@ -90,7 +90,7 @@ Length-prefixed framing и общий deadline кадра записаны в
 [ADR 0023](docs/adr/0023-persist-copy-budget-before-transfer.md).
 Итоговая encounter-сессия, reconnect и лимит peer описаны в
 [ADR 0024](docs/adr/0024-bounded-bidirectional-lan-encounter.md).
-Этап 4 начат с постоянного маршрута синтетического Envelope через
+Первый пакет Этапа 4 проверил постоянный маршрут синтетического Envelope через
 перезапущенный Relay. Трёхузловая проверка описана в
 [ADR 0025](docs/adr/0025-persistent-three-node-relay-path.md).
 Транзакционный перенос между crypto outbox и открытой очередью, а также
