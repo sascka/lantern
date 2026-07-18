@@ -7,7 +7,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Password KDF boundary for Lantern secret storage"
-readme = "README.md"
 publish = false
 
 [lints]

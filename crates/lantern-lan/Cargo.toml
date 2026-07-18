@@ -7,7 +7,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Bounded LAN connection and version negotiation for Lantern"
-readme = "README.md"
 publish = false
 
 [lints]

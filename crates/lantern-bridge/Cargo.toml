@@ -7,7 +7,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Transactional boundary between Lantern cryptography and its open queue"
-readme = "README.md"
 publish = false
 
 [lints]

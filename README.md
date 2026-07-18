@@ -9,9 +9,9 @@
 **Короткие личные сообщения без интернета и постоянной инфраструктуры**
 
 [![Status](https://img.shields.io/badge/status-experimental%20preview-F59E0B)](SECURITY.md)
-[![Platform](https://img.shields.io/badge/platform-Linux-111827?logo=linux&logoColor=white)](apps/lantern-cli/README.md)
+[![Platform](https://img.shields.io/badge/platform-Linux-111827?logo=linux&logoColor=white)](DEMO.md)
 [![Rust](https://img.shields.io/badge/Rust-1.97.1-000000?logo=rust&logoColor=white)](rust-toolchain.toml)
-[![Telemetry](https://img.shields.io/badge/telemetry-none-0891B2)](PRIVACY.md)
+[![Telemetry](https://img.shields.io/badge/telemetry-none-0891B2)](SECURITY.md)
 
 [![Demo](https://img.shields.io/badge/OPEN_DEMO-0F766E?style=for-the-badge)](DEMO.md)
 [![Security](https://img.shields.io/badge/SECURITY-1D4ED8?style=for-the-badge)](SECURITY.md)
@@ -63,8 +63,8 @@ Alice и Bob не соединяются напрямую. Relay видит ча
 - воспроизводимый симулятор Direct Delivery, Epidemic и Binary Spray-and-Wait;
 - 278 Rust-тестов и 141 тест симулятора, включая негативные сценарии.
 
-Текущая версия остаётся `experimental preview`. Подробный результат находится
-в [отчёте Этапа 4](docs/reports/STAGE4_MVP_AUDIT.md).
+Текущая версия остаётся `experimental preview` и не проходила независимый
+аудит безопасности.
 
 ## Быстрый старт на Arch Linux
 
@@ -99,19 +99,14 @@ release-версию CLI и выполняет Rust- и Python-тесты.
 
 </details>
 
-## Документация
+## Основные документы
 
-| Начать отсюда | Для чего нужен документ |
+| Документ | Для чего он нужен |
 | --- | --- |
-| [VISION.md](VISION.md) | цель и принципы Lantern |
-| [MVP.md](MVP.md) | точные границы первой версии |
-| [THREAT_MODEL.md](THREAT_MODEL.md) | противники, защищаемые данные и ограничения |
-| [PROTOCOL.md](PROTOCOL.md) | Envelope, лимиты и состояния |
-| [ROADMAP.md](ROADMAP.md) | этапы разработки |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | правила изменений и проверок |
-
-Архитектурные решения находятся в [docs/adr](docs/adr), а подробные инструкции
-по компонентам - рядом с соответствующими crate.
+| [DEMO.md](DEMO.md) | полная демонстрация Alice -> Relay -> Bob |
+| [SECURITY.md](SECURITY.md) | уровень готовности и правила безопасности |
+| [LICENSES.md](LICENSES.md) | лицензирование частей проекта |
+| [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | зависимости и уведомления |
 
 ## Безопасность
 
@@ -120,15 +115,14 @@ release-версию CLI и выполняет Rust- и Python-тесты.
 выделений памяти. Автоматические тесты не являются доказательством безопасности
 и не заменяют аудит.
 
-Угрозы и известные ограничения описаны в
-[THREAT_MODEL.md](THREAT_MODEL.md), [PRIVACY.md](PRIVACY.md) и
+Известные ограничения и порядок сообщения о проблемах описаны в
 [SECURITY.md](SECURITY.md).
 
 ## Лицензии
 
 [![MPL 2.0](https://img.shields.io/badge/Rust%20libraries%20%26%20simulator-MPL--2.0-2563EB)](LICENSES/MPL-2.0.txt)
 [![AGPL 3.0](https://img.shields.io/badge/applications-AGPL--3.0--or--later-7C3AED)](LICENSES/AGPL-3.0-or-later.txt)
-[![CC BY 4.0](https://img.shields.io/badge/protocol-CC%20BY%204.0-0891B2)](LICENSES/CC-BY-4.0.txt)
+[![CC BY-SA 4.0](https://img.shields.io/badge/documentation-CC%20BY--SA%204.0-0891B2)](LICENSES/CC-BY-SA-4.0.txt)
 
 Полная схема лицензирования и уведомления о зависимостях находятся в
 [LICENSES.md](LICENSES.md) и [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

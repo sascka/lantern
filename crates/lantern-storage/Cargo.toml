@@ -7,7 +7,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Bounded SQLite persistence for Lantern queues"
-readme = "README.md"
 publish = false
 
 [lints]

@@ -30,7 +30,7 @@ cargo test --workspace --all-targets --all-features --locked
 
 python_bin="$repository/simulator/.venv/bin/python"
 if [ ! -x "$python_bin" ]; then
-    echo "simulator/.venv is missing; follow simulator/README.md" >&2
+    echo "simulator/.venv is missing; install simulator/requirements-dev.txt" >&2
     exit 1
 fi
 

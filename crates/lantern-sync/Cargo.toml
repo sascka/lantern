@@ -7,7 +7,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Bounded transport-independent Envelope synchronization for Lantern"
-readme = "README.md"
 publish = false
 
 [lints]
